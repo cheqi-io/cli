@@ -1,0 +1,88 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+out/
+lib/
+*.tsbuildinfo
+
+# Package artifacts
+*.tgz
+*.tar.gz
+package/
+.npm/
+.npmrc.local
+
+# Runtime and CLI-local state
+.cheqi/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+!.env.sample
+*.pem
+*.key
+*.crt
+*.p12
+
+# Test and coverage output
+coverage/
+.nyc_output/
+junit.xml
+test-results/
+reports/
+
+# TypeScript and JavaScript tooling caches
+.eslintcache
+.stylelintcache
+.parcel-cache/
+.turbo/
+.vite/
+.vitest/
+.rollup.cache/
+.swc/
+.cache/
+tmp/
+temp/
+
+# Package manager metadata and caches
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/sdks
+!.yarn/versions
+.pnp.*
+.pnpm-store/
+
+# Editors and IDEs
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Local certificates and generated credentials
+certs/
+keys/
+secrets/
+
+# Misc local output
+.tmp/
+logs/

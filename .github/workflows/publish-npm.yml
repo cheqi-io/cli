@@ -1,0 +1,83 @@
+name: Publish npm package
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish, for example 0.1.1'
+        required: true
+        type: string
+      dist-tag:
+        description: 'npm dist-tag'
+        required: true
+        default: latest
+        type: choice
+        options:
+          - latest
+          - next
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-npm
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install dependencies
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm ci
+
+      - name: Set package version
+        run: |
+          CURRENT_VERSION="$(node -p "require('./package.json').version")"
+          REQUESTED_VERSION="${{ inputs.version }}"
+
+          if [ "$CURRENT_VERSION" = "$REQUESTED_VERSION" ]; then
+            echo "package.json is already at ${REQUESTED_VERSION}"
+          else
+            npm version "$REQUESTED_VERSION" --no-git-tag-version
+          fi
+
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Check package contents
+        run: npm pack --dry-run
+
+      - name: Check published version
+        id: npm-version
+        run: |
+          PACKAGE_NAME="$(node -p "require('./package.json').name")"
+          PACKAGE_VERSION="${{ inputs.version }}"
+
+          if npm view "${PACKAGE_NAME}@${PACKAGE_VERSION}" version > /dev/null 2>&1; then
+            echo "::error::Package ${PACKAGE_NAME}@${PACKAGE_VERSION} is already published."
+            exit 1
+          fi
+
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "::error::NPM_TOKEN secret is required to publish to npm."
+            exit 1
+          fi
+
+          npm publish --access public --tag "${{ inputs.dist-tag }}"
