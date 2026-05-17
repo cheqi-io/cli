@@ -1,0 +1,50 @@
+{
+  "name": "@cheqi/cli",
+  "version": "0.1.0",
+  "description": "Cheqi CLI for agent-friendly encrypted receipt workflows",
+  "license": "MIT",
+  "author": "Cheqi",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cheqi/cheqi-cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/cheqi/cheqi-cli/issues"
+  },
+  "homepage": "https://cheqi.io",
+  "keywords": [
+    "cheqi",
+    "cli",
+    "receipt",
+    "digital-receipt",
+    "encryption",
+    "agent"
+  ],
+  "type": "module",
+  "bin": {
+    "cheqi": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node ./dist/index.js help && node ./dist/index.js receipts help && node --test test/*.test.js",
+    "prepublishOnly": "npm test"
+  },
+  "dependencies": {
+    "@cheqi/sdk": "^0.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
