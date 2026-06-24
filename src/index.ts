@@ -11,10 +11,47 @@ import {
   type NotificationDisplayCode
 } from "@cheqi/sdk";
 
-const VERSION = "0.1.0";
-const CHEQI_DIR = ".cheqi";
+const VERSION = "0.2.0";
 const SESSIONS_DIR = ".cheqi/sessions";
-const ACTIVE_SESSION_PATH = ".cheqi/active-session";
+
+type ErrorCode =
+  | "AUTH_REQUIRED"
+  | "AUTH_CONFLICT"
+  | "COMMAND_NOT_FOUND"
+  | "ENV_UNSUPPORTED"
+  | "FLAG_INVALID"
+  | "FLAG_REQUIRED"
+  | "INPUT_INVALID"
+  | "RECEIPT_INVALID"
+  | "SESSION_INVALID"
+  | "SESSION_NOT_FOUND";
+
+interface AppErrorOptions {
+  code: ErrorCode;
+  message: string;
+  retryable?: boolean;
+  details?: Record<string, unknown>;
+}
+
+class AppError extends Error {
+  code: ErrorCode;
+  retryable: boolean;
+  details?: Record<string, unknown>;
+
+  constructor(options: AppErrorOptions) {
+    super(options.message);
+    this.code = options.code;
+    this.retryable = options.retryable ?? false;
+    this.details = options.details;
+  }
+}
+
+interface NextStep {
+  command: string[];
+  requiredFlags?: string[];
+  optionalFlags?: string[];
+  hint?: string;
+}
 
 interface SubmitOptions {
   apiKey: string | null;
@@ -53,109 +90,142 @@ interface Session {
 }
 
 async function main(args: string[]): Promise<void> {
+  const startedAt = Date.now();
+  try {
+    const data = await route(args);
+    printEnvelope(true, data, {
+      durationMs: Date.now() - startedAt,
+      version: VERSION
+    });
+  } catch (error) {
+    const appError = normalizeError(error);
+    printEnvelope(false, null, {
+      durationMs: Date.now() - startedAt,
+      version: VERSION
+    }, appError);
+    process.exit(1);
+  }
+}
+
+async function route(args: string[]): Promise<unknown> {
   if (args.length === 0) {
-    printUsage();
-    return;
+    return commandSchema();
   }
 
   const [command, ...rest] = args;
   switch (command) {
-    case "init":
-      await initSession(rest);
-      return;
-    case "match":
-      await matchSession(rest);
-      return;
-    case "add-product":
-      await addProduct(rest);
-      return;
-    case "preview":
-      await previewSession(rest);
-      return;
-    case "status":
-      await statusSession(rest);
-      return;
-    case "finalize":
-    case "finalize-receipt":
-      await finalizeSession(rest);
-      return;
-    case "reset":
-      await resetSession(rest);
-      return;
-    case "receipts":
-      await receipts(rest);
-      return;
+    case "session":
+      return sessionCommand(rest);
     case "receipt":
-      await receipt(rest);
-      return;
+      return receiptCommand(rest);
+    case "receipts":
+      return receiptsCommand(rest);
+    case "schema":
+      return schemaCommand(rest);
     case "version":
-      console.log(VERSION);
-      return;
+      return { version: VERSION };
     case "help":
     case "-h":
     case "--help":
-      printUsage();
-      return;
+      return commandSchema();
     default:
-      throw new Error(`Unknown command: ${command}`);
+      throw new AppError({
+        code: "COMMAND_NOT_FOUND",
+        message: `Unknown command: ${command}`,
+        details: { command }
+      });
   }
 }
 
-async function receipt(args: string[]): Promise<void> {
-  if (args.length === 0) {
-    printReceiptUsage();
-    return;
+async function sessionCommand(args: string[]): Promise<unknown> {
+  const [command, ...rest] = args;
+  switch (command) {
+    case "create":
+      if (isHelp(rest)) return commandSchema(["session", "create"]);
+      return createSession(rest);
+    case "match":
+      if (isHelp(rest)) return commandSchema(["session", "match"]);
+      return matchSession(rest);
+    case "status":
+      if (isHelp(rest)) return commandSchema(["session", "status"]);
+      return statusSession(rest);
+    case "reset":
+      if (isHelp(rest)) return commandSchema(["session", "reset"]);
+      return resetSession(rest);
+    case "help":
+    case "-h":
+    case "--help":
+    case undefined:
+      return commandSchema(["session"]);
+    default:
+      throw new AppError({
+        code: "COMMAND_NOT_FOUND",
+        message: `Unknown session command: ${command}`,
+        details: { command }
+      });
   }
+}
 
+async function receiptCommand(args: string[]): Promise<unknown> {
   const [command, ...rest] = args;
   switch (command) {
     case "set":
-      await setReceipt(rest);
-      return;
+      if (isHelp(rest)) return commandSchema(["receipt", "set"]);
+      return setReceipt(rest);
     case "add-product":
-      await addProduct(rest);
-      return;
+      if (isHelp(rest)) return commandSchema(["receipt", "add-product"]);
+      return addProduct(rest);
     case "preview":
-      await previewSession(rest);
-      return;
+      if (isHelp(rest)) return commandSchema(["receipt", "preview"]);
+      return previewSession(rest);
+    case "validate":
+      if (isHelp(rest)) return commandSchema(["receipt", "validate"]);
+      return validateSession(rest);
     case "finalize":
-      await finalizeSession(rest);
-      return;
+      if (isHelp(rest)) return commandSchema(["receipt", "finalize"]);
+      return finalizeSession(rest);
     case "help":
     case "-h":
     case "--help":
-      printReceiptUsage();
-      return;
+    case undefined:
+      return commandSchema(["receipt"]);
     default:
-      throw new Error(`Unknown receipt command: ${command}`);
+      throw new AppError({
+        code: "COMMAND_NOT_FOUND",
+        message: `Unknown receipt command: ${command}`,
+        details: { command }
+      });
   }
 }
 
-async function receipts(args: string[]): Promise<void> {
-  if (args.length === 0) {
-    printReceiptsUsage();
-    return;
-  }
-
+async function receiptsCommand(args: string[]): Promise<unknown> {
   const [command, ...rest] = args;
   switch (command) {
     case "submit":
-      await submitReceipt(rest);
-      return;
+      if (isHelp(rest)) return commandSchema(["receipts", "submit"]);
+      return submitReceipt(rest);
     case "help":
     case "-h":
     case "--help":
-      printReceiptsUsage();
-      return;
+    case undefined:
+      return commandSchema(["receipts"]);
     default:
-      throw new Error(`Unknown receipts command: ${command}`);
+      throw new AppError({
+        code: "COMMAND_NOT_FOUND",
+        message: `Unknown receipts command: ${command}`,
+        details: { command }
+      });
   }
 }
 
-async function initSession(args: string[]): Promise<void> {
+async function schemaCommand(args: string[]): Promise<unknown> {
+  return commandSchema(args);
+}
+
+async function createSession(args: string[]): Promise<unknown> {
   const flags = parseFlags(args);
   const now = new Date().toISOString();
-  const sessionId = resolveNewSessionId(flags);
+  const sessionId = requireSessionId(flags);
   const session: Session = {
     version: 1,
     id: sessionId,
@@ -186,29 +256,32 @@ async function initSession(args: string[]): Promise<void> {
   }
 
   await saveSession(session);
-  await setActiveSession(session.id);
-  printJson({
+  return {
     sessionId: session.id,
     session: sessionPath(session.id),
-    nextStep: session.identificationDetails
-      ? `cheqi add-product --session ${session.id} --name ... --price-incl ... --vat ...`
-      : `cheqi match --session ${session.id} --card-par ...`,
     receipt: session.receipt,
-    hasMatch: Boolean(session.identificationDetails)
-  });
+    hasMatch: Boolean(session.identificationDetails),
+    nextStep: session.identificationDetails
+      ? nextStep(["receipt", "add-product"], ["session", "name"], ["price-incl", "unit-price", "vat"], "Add at least one product before validation or finalization.")
+      : nextStep(["session", "match"], ["session"], ["card-par", "pairing-code", "payment-account-identifier", "email"], "Match the customer before finalizing the receipt.")
+  };
 }
 
-async function matchSession(args: string[]): Promise<void> {
+async function matchSession(args: string[]): Promise<unknown> {
   const flags = parseFlags(args);
   const auth = parseAuthOptions(args);
   validateAuth(auth);
 
   const identificationDetails = identificationDetailsFromFlags(flags);
   if (!identificationDetails) {
-    throw new Error("Provide one match flag: --card-par, --pairing-code, --payment-account-identifier, or --email");
+    throw new AppError({
+      code: "FLAG_REQUIRED",
+      message: "Provide one match flag: --card-par, --pairing-code, --payment-account-identifier, or --email",
+      details: { flags: ["card-par", "pairing-code", "payment-account-identifier", "email"] }
+    });
   }
 
-  const session = await loadOrCreateSession(auth, sessionIdFromFlags(flags));
+  const session = await loadSession(requireSessionId(flags));
   session.identificationDetails = identificationDetails as unknown as Record<string, unknown>;
   session.auth.env = auth.env;
   session.auth.endpoint = auth.endpoint;
@@ -220,21 +293,20 @@ async function matchSession(args: string[]): Promise<void> {
   ) as Record<string, unknown>;
   touch(session);
   await saveSession(session);
-  await setActiveSession(session.id);
 
-  printJson({
+  return {
     sessionId: session.id,
     session: sessionPath(session.id),
     customerFound: session.matchResponse.customerFound,
     matchId: session.matchResponse.matchId,
     recipientCount: Array.isArray(session.matchResponse.recipients) ? session.matchResponse.recipients.length : 0,
-    nextStep: `cheqi add-product --session ${session.id} --name ... --price-incl ... --vat ...`
-  });
+    nextStep: nextStep(["receipt", "add-product"], ["session", "name"], ["price-incl", "unit-price", "vat"], "Add product lines before validation or finalization.")
+  };
 }
 
-async function setReceipt(args: string[]): Promise<void> {
+async function setReceipt(args: string[]): Promise<unknown> {
   const flags = parseFlags(args);
-  const session = await loadSession(sessionIdFromFlags(flags));
+  const session = await loadSession(requireSessionId(flags));
   const receipt = session.receipt;
 
   setIfPresent(receipt, "documentNumber", stringFlag(flags, "document-number") ?? stringFlag(flags, "documentNumber"));
@@ -247,15 +319,24 @@ async function setReceipt(args: string[]): Promise<void> {
 
   touch(session);
   await saveSession(session);
-  printJson({ sessionId: session.id, session: sessionPath(session.id), receipt });
+  return {
+    sessionId: session.id,
+    session: sessionPath(session.id),
+    receipt,
+    nextStep: nextStep(["receipt", "add-product"], ["session", "name"], ["price-incl", "unit-price", "vat"])
+  };
 }
 
-async function addProduct(args: string[]): Promise<void> {
+async function addProduct(args: string[]): Promise<unknown> {
   const flags = parseFlags(args);
   const positionalName = flags._[0];
   const name = stringFlag(flags, "name") ?? positionalName;
   if (!name) {
-    throw new Error("Product name is required. Use --name \"Nike Shoes\" or pass the name as the first argument.");
+    throw new AppError({
+      code: "FLAG_REQUIRED",
+      message: "Product name is required. Use --name \"Nike Shoes\" or pass the name as the first argument.",
+      details: { flag: "name" }
+    });
   }
 
   const quantity = numberFlag(flags, "quantity") ?? numberFlag(flags, "qty") ?? 1;
@@ -269,7 +350,11 @@ async function addProduct(args: string[]): Promise<void> {
   const unitPrice = numberFlag(flags, "unit-price") ?? numberFlag(flags, "unitPrice") ?? numberFlag(flags, "price-excl") ?? numberFlag(flags, "priceExcl");
 
   if (priceIncl === undefined && unitPrice === undefined) {
-    throw new Error("Provide --price-incl or --unit-price");
+    throw new AppError({
+      code: "FLAG_REQUIRED",
+      message: "Provide --price-incl or --unit-price",
+      details: { flags: ["price-incl", "unit-price"] }
+    });
   }
 
   const netUnitPrice = unitPrice ?? roundMoney((priceIncl as number) / (1 + vatRate / 100));
@@ -296,7 +381,7 @@ async function addProduct(args: string[]): Promise<void> {
     total
   };
 
-  const session = await loadSession(sessionIdFromFlags(flags));
+  const session = await loadSession(requireSessionId(flags));
   const products = Array.isArray(session.receipt.products) ? session.receipt.products : [];
   products.push(product);
   session.receipt.products = products;
@@ -304,43 +389,56 @@ async function addProduct(args: string[]): Promise<void> {
 
   touch(session);
   await saveSession(session);
-  printJson({
+  return {
     sessionId: session.id,
     session: sessionPath(session.id),
     added: product,
     totals: totals(session.receipt),
-    nextStep: `cheqi preview --session ${session.id} or cheqi finalize-receipt --session ${session.id}`
-  });
+    nextStep: nextStep(["receipt", "validate"], ["session"], [], "Validate locally before finalizing.")
+  };
 }
 
-async function previewSession(args: string[] = []): Promise<void> {
-  const session = await loadSession(sessionIdFromFlags(parseFlags(args)));
+async function previewSession(args: string[]): Promise<unknown> {
+  const session = await loadSession(requireSessionId(parseFlags(args)));
   recomputeTotals(session.receipt);
-  printJson(session);
+  return {
+    session,
+    nextStep: nextStep(["receipt", "validate"], ["session"], [], "Validate locally before finalizing.")
+  };
 }
 
-async function statusSession(args: string[] = []): Promise<void> {
-  const session = await loadSession(sessionIdFromFlags(parseFlags(args)));
-  printJson({
+async function statusSession(args: string[]): Promise<unknown> {
+  const session = await loadSession(requireSessionId(parseFlags(args)));
+  return {
     sessionId: session.id,
     session: sessionPath(session.id),
     hasMatch: Boolean(session.identificationDetails),
     hasMatchResponse: Boolean(session.matchResponse),
     productCount: Array.isArray(session.receipt.products) ? session.receipt.products.length : 0,
     totals: totals(session.receipt),
-    updatedAt: session.updatedAt
-  });
+    updatedAt: session.updatedAt,
+    nextStep: statusNextStep(session)
+  };
 }
 
-async function finalizeSession(args: string[]): Promise<void> {
+async function validateSession(args: string[]): Promise<unknown> {
+  const session = await loadSession(requireSessionId(parseFlags(args)));
+  recomputeTotals(session.receipt);
+  validateReadyToFinalize(session);
+  return {
+    valid: true,
+    sessionId: session.id,
+    totals: totals(session.receipt),
+    nextStep: nextStep(["receipt", "finalize"], ["session"], ["api-key", "access-token", "env", "endpoint", "timeout"], "Finalize only after local validation succeeds.")
+  };
+}
+
+async function finalizeSession(args: string[]): Promise<unknown> {
   const auth = parseAuthOptions(args);
   validateAuth(auth);
   const flags = parseFlags(args);
-  const session = await loadSession(sessionIdFromFlags(flags));
-  if (!session.identificationDetails) {
-    throw new Error("No match details in the session. Run cheqi match first.");
-  }
-  validateReceiptDraft(session.receipt);
+  const session = await loadSession(requireSessionId(flags));
+  validateReadyToFinalize(session);
   recomputeTotals(session.receipt);
 
   const sdk = buildSDK({
@@ -357,7 +455,7 @@ async function finalizeSession(args: string[]): Promise<void> {
   );
 
   const response = isRecord(result.response) ? result.response : null;
-  printJson({
+  return {
     success: result.success,
     deliveryMethod: result.deliveryMethod,
     customerFound: result.customerFound,
@@ -369,26 +467,16 @@ async function finalizeSession(args: string[]): Promise<void> {
     message: result.message,
     sessionId: session.id,
     session: sessionPath(session.id)
-  });
+  };
 }
 
-async function resetSession(args: string[] = []): Promise<void> {
-  const flags = parseFlags(args);
-  const sessionId = sessionIdFromFlags(flags) ?? await getActiveSessionId();
-  if (!sessionId) {
-    await rm(ACTIVE_SESSION_PATH, { force: true });
-    printJson({ reset: true });
-    return;
-  }
+async function resetSession(args: string[]): Promise<unknown> {
+  const sessionId = requireSessionId(parseFlags(args));
   await rm(sessionPath(sessionId), { force: true });
-  const active = await getActiveSessionId();
-  if (active === sessionId) {
-    await rm(ACTIVE_SESSION_PATH, { force: true });
-  }
-  printJson({ sessionId, session: sessionPath(sessionId), reset: true });
+  return { sessionId, session: sessionPath(sessionId), reset: true };
 }
 
-async function submitReceipt(args: string[]): Promise<void> {
+async function submitReceipt(args: string[]): Promise<unknown> {
   const options = parseSubmitOptions(args);
   validateSubmitOptions(options);
 
@@ -416,7 +504,7 @@ async function submitReceipt(args: string[]): Promise<void> {
   );
 
   const response = isRecord(result.response) ? result.response : null;
-  printJson({
+  return {
     success: result.success,
     deliveryMethod: result.deliveryMethod,
     customerFound: result.customerFound,
@@ -427,7 +515,286 @@ async function submitReceipt(args: string[]): Promise<void> {
     response: result.response,
     message: result.message,
     customerEmail: result.customerEmail
-  });
+  };
+}
+
+function commandSchema(path: string[] = []): unknown {
+  const commands = [
+    {
+      command: ["session", "create"],
+      summary: "Create a local receipt session.",
+      positional: [],
+      flags: [
+        flag("session", "string", true),
+        flag("currency", "string", false, "EUR"),
+        flag("document-number", "string", false),
+        flag("issue-date", "string", false, "now"),
+        flag("env", "enum", false, "sandbox", ["sandbox", "test", "production"]),
+        flag("endpoint", "string", false),
+        flag("card-par", "string", false),
+        flag("pairing-code", "string", false),
+        flag("payment-account-identifier", "string", false),
+        flag("email", "string", false)
+      ],
+      response: "SessionCreateResponse",
+      responseSchema: responseSchema("SessionCreateResponse")
+    },
+    {
+      command: ["session", "match"],
+      summary: "Match a customer for an existing session.",
+      positional: [],
+      flags: authFlags([
+        flag("session", "string", true),
+        flag("card-par", "string", false),
+        flag("pairing-code", "string", false),
+        flag("payment-account-identifier", "string", false),
+        flag("email", "string", false)
+      ]),
+      response: "SessionMatchResponse",
+      responseSchema: responseSchema("SessionMatchResponse")
+    },
+    {
+      command: ["session", "status"],
+      summary: "Inspect local session state.",
+      positional: [],
+      flags: [flag("session", "string", true)],
+      response: "SessionStatusResponse",
+      responseSchema: responseSchema("SessionStatusResponse")
+    },
+    {
+      command: ["session", "reset"],
+      summary: "Delete a local session.",
+      positional: [],
+      flags: [flag("session", "string", true)],
+      response: "SessionResetResponse",
+      responseSchema: responseSchema("SessionResetResponse")
+    },
+    {
+      command: ["receipt", "set"],
+      summary: "Update receipt-level fields.",
+      positional: [],
+      flags: [
+        flag("session", "string", true),
+        flag("document-number", "string", false),
+        flag("currency", "string", false),
+        flag("issue-date", "string", false),
+        flag("note", "string", false)
+      ],
+      response: "ReceiptSetResponse",
+      responseSchema: responseSchema("ReceiptSetResponse")
+    },
+    {
+      command: ["receipt", "add-product"],
+      summary: "Append a product line to a local receipt draft.",
+      positional: [
+        {
+          name: "name",
+          type: "string",
+          required: false,
+          description: "Product name. Equivalent to --name when present."
+        }
+      ],
+      flags: [
+        flag("session", "string", true),
+        flag("name", "string", false),
+        flag("price-incl", "number", false),
+        flag("unit-price", "number", false),
+        flag("quantity", "number", false, 1),
+        flag("vat", "number", false, 0),
+        flag("tax-type", "string", false, "VAT"),
+        flag("unit-code", "string", false, "C62"),
+        flag("brand", "string", false),
+        flag("sku", "string", false)
+      ],
+      response: "ReceiptAddProductResponse",
+      responseSchema: responseSchema("ReceiptAddProductResponse")
+    },
+    {
+      command: ["receipt", "preview"],
+      summary: "Return the full local session draft.",
+      positional: [],
+      flags: [flag("session", "string", true)],
+      response: "ReceiptPreviewResponse",
+      responseSchema: responseSchema("ReceiptPreviewResponse")
+    },
+    {
+      command: ["receipt", "validate"],
+      summary: "Validate local receipt state without network side effects.",
+      positional: [],
+      flags: [flag("session", "string", true)],
+      response: "ReceiptValidateResponse",
+      responseSchema: responseSchema("ReceiptValidateResponse")
+    },
+    {
+      command: ["receipt", "finalize"],
+      summary: "Submit an existing local session receipt.",
+      positional: [],
+      flags: authFlags([flag("session", "string", true)]),
+      response: "ReceiptFinalizeResponse",
+      responseSchema: responseSchema("ReceiptFinalizeResponse")
+    },
+    {
+      command: ["receipts", "submit"],
+      summary: "Submit a receipt JSON file or stdin without creating a local session.",
+      positional: [],
+      flags: authFlags([
+        flag("receipt", "string", true),
+        flag("match-by", "enum", true, undefined, ["card_par", "pairing_code", "payment_account_identifier", "email"]),
+        flag("match-value", "string", true),
+        flag("notification-display-code", "json", false)
+      ]),
+      response: "ReceiptSubmitResponse",
+      responseSchema: responseSchema("ReceiptSubmitResponse")
+    }
+  ];
+
+  const selected = path.length === 0
+    ? commands
+    : commands.filter((command) => path.every((part, index) => command.command[index] === part));
+
+  if (selected.length === 0) {
+    throw new AppError({
+      code: "COMMAND_NOT_FOUND",
+      message: `No schema found for: ${path.join(" ")}`,
+      details: { command: path }
+    });
+  }
+
+  return {
+    version: VERSION,
+    envelope: {
+      success: { ok: true, data: {}, meta: { durationMs: 0, version: VERSION } },
+      failure: {
+        ok: false,
+        error: { code: "ERROR_CODE", message: "Human-readable message", retryable: false, details: {} },
+        meta: { durationMs: 0, version: VERSION }
+      }
+    },
+    commands: selected
+  };
+}
+
+function flag(name: string, type: string, required: boolean, defaultValue?: unknown, values?: string[]): Record<string, unknown> {
+  return { name, type, required, default: defaultValue, values };
+}
+
+function responseSchema(name: string): Record<string, unknown> {
+  const baseProperties = {
+    sessionId: { type: "string" },
+    session: { type: "string" },
+    nextStep: nextStepSchema()
+  };
+
+  switch (name) {
+    case "SessionCreateResponse":
+      return objectSchema({
+        ...baseProperties,
+        receipt: { type: "object", additionalProperties: true },
+        hasMatch: { type: "boolean" }
+      }, ["sessionId", "session", "receipt", "hasMatch", "nextStep"]);
+    case "SessionMatchResponse":
+      return objectSchema({
+        ...baseProperties,
+        customerFound: { type: "boolean" },
+        matchId: { type: "string" },
+        recipientCount: { type: "number" }
+      }, ["sessionId", "session", "customerFound", "recipientCount", "nextStep"]);
+    case "SessionStatusResponse":
+      return objectSchema({
+        ...baseProperties,
+        hasMatch: { type: "boolean" },
+        hasMatchResponse: { type: "boolean" },
+        productCount: { type: "number" },
+        totals: totalsSchema(),
+        updatedAt: { type: "string", format: "date-time" }
+      }, ["sessionId", "session", "hasMatch", "hasMatchResponse", "productCount", "totals", "updatedAt", "nextStep"]);
+    case "SessionResetResponse":
+      return objectSchema({
+        sessionId: { type: "string" },
+        session: { type: "string" },
+        reset: { type: "boolean", const: true }
+      }, ["sessionId", "session", "reset"]);
+    case "ReceiptSetResponse":
+      return objectSchema({
+        ...baseProperties,
+        receipt: { type: "object", additionalProperties: true }
+      }, ["sessionId", "session", "receipt", "nextStep"]);
+    case "ReceiptAddProductResponse":
+      return objectSchema({
+        ...baseProperties,
+        added: { type: "object", additionalProperties: true },
+        totals: totalsSchema()
+      }, ["sessionId", "session", "added", "totals", "nextStep"]);
+    case "ReceiptPreviewResponse":
+      return objectSchema({
+        session: { type: "object", additionalProperties: true },
+        nextStep: nextStepSchema()
+      }, ["session", "nextStep"]);
+    case "ReceiptValidateResponse":
+      return objectSchema({
+        valid: { type: "boolean", const: true },
+        sessionId: { type: "string" },
+        totals: totalsSchema(),
+        nextStep: nextStepSchema()
+      }, ["valid", "sessionId", "totals", "nextStep"]);
+    case "ReceiptFinalizeResponse":
+    case "ReceiptSubmitResponse":
+      return objectSchema({
+        success: { type: "boolean" },
+        deliveryMethod: { type: "string" },
+        customerFound: { type: "boolean" },
+        receiptCount: { type: "number" },
+        cheqiReceiptId: { type: "string" },
+        createdAt: { type: "string", format: "date-time" },
+        templateHash: { type: "string" },
+        response: { type: ["object", "array", "string", "number", "boolean", "null"] },
+        message: { type: "string" },
+        customerEmail: { type: "string" },
+        sessionId: { type: "string" },
+        session: { type: "string" }
+      }, ["success", "deliveryMethod", "customerFound", "receiptCount", "response", "message"]);
+    default:
+      return objectSchema({}, []);
+  }
+}
+
+function objectSchema(properties: Record<string, unknown>, required: string[]): Record<string, unknown> {
+  return {
+    type: "object",
+    additionalProperties: false,
+    required,
+    properties
+  };
+}
+
+function nextStepSchema(): Record<string, unknown> {
+  return objectSchema({
+    command: { type: "array", items: { type: "string" } },
+    requiredFlags: { type: "array", items: { type: "string" } },
+    optionalFlags: { type: "array", items: { type: "string" } },
+    hint: { type: "string" }
+  }, ["command"]);
+}
+
+function totalsSchema(): Record<string, unknown> {
+  return objectSchema({
+    receiptSubtotal: { type: "number" },
+    totalBeforeTax: { type: "number" },
+    totalTaxAmount: { type: "number" },
+    totalAmount: { type: "number" }
+  }, ["receiptSubtotal", "totalBeforeTax", "totalTaxAmount", "totalAmount"]);
+}
+
+function authFlags(flags: Record<string, unknown>[]): Record<string, unknown>[] {
+  return [
+    ...flags,
+    flag("api-key", "string", false),
+    flag("access-token", "string", false),
+    flag("env", "enum", false, "sandbox", ["sandbox", "test", "production"]),
+    flag("endpoint", "string", false),
+    flag("timeout", "number", false, 30),
+    flag("verbose", "boolean", false, false)
+  ];
 }
 
 function parseSubmitOptions(args: string[]): SubmitOptions {
@@ -477,12 +844,12 @@ function parseSubmitOptions(args: string[]): SubmitOptions {
       case "--verbose":
         options.verbose = true;
         break;
-      case "-h":
-      case "--help":
-        printSubmitUsage();
-        process.exit(0);
       default:
-        throw new Error(`Unknown option: ${arg}`);
+        throw new AppError({
+          code: "FLAG_INVALID",
+          message: `Unknown option: ${arg}`,
+          details: { flag: arg }
+        });
     }
   }
 
@@ -491,20 +858,15 @@ function parseSubmitOptions(args: string[]): SubmitOptions {
 
 function validateSubmitOptions(options: SubmitOptions): void {
   if (!options.receiptPath) {
-    throw new Error("--receipt is required");
+    throw requiredFlag("receipt");
   }
   if (!options.matchBy) {
-    throw new Error("--match-by is required");
+    throw requiredFlag("match-by");
   }
   if (!options.matchValue) {
-    throw new Error("--match-value is required");
+    throw requiredFlag("match-value");
   }
-  if (!options.apiKey && !options.accessToken) {
-    throw new Error("Set --api-key, --access-token, CHEQI_API_KEY, or CHEQI_ACCESS_TOKEN");
-  }
-  if (options.apiKey && options.accessToken) {
-    throw new Error("Use either API key authentication or access token authentication, not both");
-  }
+  validateAuth(options);
 }
 
 function parseAuthOptions(args: string[]): AuthOptions {
@@ -519,12 +881,18 @@ function parseAuthOptions(args: string[]): AuthOptions {
   };
 }
 
-function validateAuth(options: AuthOptions): void {
+function validateAuth(options: Pick<AuthOptions, "apiKey" | "accessToken">): void {
   if (!options.apiKey && !options.accessToken) {
-    throw new Error("Set --api-key, --access-token, CHEQI_API_KEY, or CHEQI_ACCESS_TOKEN");
+    throw new AppError({
+      code: "AUTH_REQUIRED",
+      message: "Set --api-key, --access-token, CHEQI_API_KEY, or CHEQI_ACCESS_TOKEN"
+    });
   }
   if (options.apiKey && options.accessToken) {
-    throw new Error("Use either API key authentication or access token authentication, not both");
+    throw new AppError({
+      code: "AUTH_CONFLICT",
+      message: "Use either API key authentication or access token authentication, not both"
+    });
   }
 }
 
@@ -555,7 +923,11 @@ function resolveEndpoint(options: Pick<AuthOptions, "endpoint" | "env">): string
     case "prod":
       return Environment.PRODUCTION;
     default:
-      throw new Error(`Unsupported environment: ${options.env}`);
+      throw new AppError({
+        code: "ENV_UNSUPPORTED",
+        message: `Unsupported environment: ${options.env}`,
+        details: { env: options.env, supported: ["sandbox", "test", "production"] }
+      });
   }
 }
 
@@ -593,12 +965,16 @@ function parseFlags(args: string[]): Flags {
   return flags;
 }
 
-function sessionIdFromFlags(flags: Flags): string | null {
-  return sanitizeSessionId(stringFlag(flags, "session") ?? stringFlag(flags, "session-id") ?? stringFlag(flags, "sessionId"));
+function requireSessionId(flags: Flags): string {
+  const sessionId = sessionIdFromFlags(flags);
+  if (!sessionId) {
+    throw requiredFlag("session");
+  }
+  return sessionId;
 }
 
-function resolveNewSessionId(flags: Flags): string {
-  return sessionIdFromFlags(flags) ?? `receipt-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+function sessionIdFromFlags(flags: Flags): string | null {
+  return sanitizeSessionId(stringFlag(flags, "session") ?? stringFlag(flags, "session-id") ?? stringFlag(flags, "sessionId"));
 }
 
 function sanitizeSessionId(value: string | null): string | null {
@@ -607,37 +983,17 @@ function sanitizeSessionId(value: string | null): string | null {
   }
   const sanitized = value.trim().replace(/[^A-Za-z0-9._-]/g, "-");
   if (!sanitized || sanitized === "." || sanitized === "..") {
-    throw new Error("Invalid session id");
+    throw new AppError({
+      code: "SESSION_INVALID",
+      message: "Invalid session id",
+      details: { value }
+    });
   }
   return sanitized;
 }
 
 function sessionPath(sessionId: string): string {
   return `${SESSIONS_DIR}/${sessionId}.json`;
-}
-
-async function setActiveSession(sessionId: string): Promise<void> {
-  await mkdir(CHEQI_DIR, { recursive: true });
-  await writeFile(ACTIVE_SESSION_PATH, `${sessionId}\n`, "utf8");
-}
-
-async function getActiveSessionId(): Promise<string | null> {
-  try {
-    return sanitizeSessionId((await readFile(ACTIVE_SESSION_PATH, "utf8")).trim());
-  } catch (error) {
-    if (isNodeError(error) && error.code === "ENOENT") {
-      return null;
-    }
-    throw error;
-  }
-}
-
-async function resolveExistingSessionId(requestedSessionId: string | null): Promise<string> {
-  const sessionId = requestedSessionId ?? await getActiveSessionId();
-  if (!sessionId) {
-    throw new Error("No active Cheqi session found. Run cheqi init or pass --session <id>.");
-  }
-  return sessionId;
 }
 
 function stringFlag(flags: Flags, name: string): string | null {
@@ -655,7 +1011,14 @@ function numberFlag(flags: Flags, name: string): number | undefined {
   }
   const normalized = value.replace(",", ".");
   const parsed = Number.parseFloat(normalized);
-  return Number.isFinite(parsed) ? parsed : undefined;
+  if (!Number.isFinite(parsed)) {
+    throw new AppError({
+      code: "FLAG_INVALID",
+      message: `--${name} must be a number`,
+      details: { flag: name, value }
+    });
+  }
+  return parsed;
 }
 
 function booleanFlag(flags: Flags, name: string): boolean {
@@ -690,59 +1053,45 @@ function identificationDetailsFromFlags(flags: Flags): IdentificationDetails | n
 
 async function readReceipt(path: string): Promise<Record<string, unknown>> {
   const raw = path === "-" ? await readStdin() : await readFile(path, "utf8");
-  return JSON.parse(raw) as Record<string, unknown>;
+  try {
+    return JSON.parse(raw) as Record<string, unknown>;
+  } catch (error) {
+    throw new AppError({
+      code: "INPUT_INVALID",
+      message: "Receipt input must be valid JSON",
+      details: { path, reason: error instanceof Error ? error.message : String(error) }
+    });
+  }
 }
 
-async function loadSession(requestedSessionId: string | null = null): Promise<Session> {
-  const sessionId = await resolveExistingSessionId(requestedSessionId);
+async function loadSession(sessionId: string): Promise<Session> {
   let raw: string;
   try {
     raw = await readFile(sessionPath(sessionId), "utf8");
   } catch (error) {
     if (isNodeError(error) && error.code === "ENOENT") {
-      throw new Error(`No Cheqi session found for ${sessionId}. Run cheqi init --session ${sessionId} first.`);
+      throw new AppError({
+        code: "SESSION_NOT_FOUND",
+        message: `No Cheqi session found for ${sessionId}. Run cheqi session create --session ${sessionId} first.`,
+        details: { sessionId },
+        retryable: false
+      });
     }
     throw error;
   }
-  const session = JSON.parse(raw) as Session;
-  if (!session.id) {
-    session.id = sessionId;
-  }
-  return session;
-}
 
-async function loadOrCreateSession(auth: AuthOptions, requestedSessionId: string | null = null): Promise<Session> {
   try {
-    return await loadSession(requestedSessionId);
-  } catch (error) {
-    if (!(error instanceof Error) || !error.message.includes("No Cheqi session found")) {
-      throw error;
+    const session = JSON.parse(raw) as Session;
+    if (!session.id) {
+      session.id = sessionId;
     }
-    const now = new Date().toISOString();
-    const sessionId = requestedSessionId ?? `receipt-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-    return {
-      version: 1,
-      id: sessionId,
-      createdAt: now,
-      updatedAt: now,
-      auth: {
-        env: auth.env,
-        endpoint: auth.endpoint
-      },
-      identificationDetails: null,
-      matchResponse: null,
-      receipt: {
-        documentNumber: `RECEIPT-${Date.now()}`,
-        issueDate: now,
-        currency: "EUR",
-        receiptSubtotal: 0,
-        totalBeforeTax: 0,
-        totalTaxAmount: 0,
-        totalAmount: 0,
-        products: [],
-        taxes: []
-      }
-    };
+    return session;
+  } catch (error) {
+    throw new AppError({
+      code: "SESSION_INVALID",
+      message: `Session ${sessionId} is not valid JSON`,
+      details: { sessionId, reason: error instanceof Error ? error.message : String(error) }
+    });
   }
 }
 
@@ -764,7 +1113,11 @@ function parseIssueDate(value: string): string {
   }
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) {
-    throw new Error(`Invalid issue date: ${value}`);
+    throw new AppError({
+      code: "INPUT_INVALID",
+      message: `Invalid issue date: ${value}`,
+      details: { value }
+    });
   }
   return date.toISOString();
 }
@@ -809,15 +1162,34 @@ function totals(receipt: Record<string, unknown>): Record<string, unknown> {
   };
 }
 
+function validateReadyToFinalize(session: Session): void {
+  if (!session.identificationDetails) {
+    throw new AppError({
+      code: "RECEIPT_INVALID",
+      message: "No match details in the session. Run cheqi session match first.",
+      details: { field: "identificationDetails" }
+    });
+  }
+  validateReceiptDraft(session.receipt);
+}
+
 function validateReceiptDraft(receipt: Record<string, unknown>): void {
   const required = ["documentNumber", "issueDate", "currency"];
   for (const field of required) {
     if (typeof receipt[field] !== "string" || receipt[field] === "") {
-      throw new Error(`Receipt ${field} is required. Run cheqi receipt set --${field} ...`);
+      throw new AppError({
+        code: "RECEIPT_INVALID",
+        message: `Receipt ${field} is required. Run cheqi receipt set --session <id> --${field} ...`,
+        details: { field }
+      });
     }
   }
   if (!Array.isArray(receipt.products) || receipt.products.length === 0) {
-    throw new Error("At least one product is required. Run cheqi add-product --name ... --price-incl ...");
+    throw new AppError({
+      code: "RECEIPT_INVALID",
+      message: "At least one product is required. Run cheqi receipt add-product --session <id> --name ... --price-incl ...",
+      details: { field: "products" }
+    });
   }
 }
 
@@ -861,22 +1233,38 @@ function buildIdentificationDetails(matchBy: string, value: string): Identificat
         recipientEmail: value
       } as IdentificationDetails;
     default:
-      throw new Error("Unsupported --match-by. Use card_par, pairing_code, payment_account_identifier, or email");
+      throw new AppError({
+        code: "FLAG_INVALID",
+        message: "Unsupported --match-by. Use card_par, pairing_code, payment_account_identifier, or email",
+        details: { matchBy, supported: ["card_par", "pairing_code", "payment_account_identifier", "email"] }
+      });
   }
 }
 
 function parseNotificationDisplayCode(raw: string): NotificationDisplayCode {
-  const value = JSON.parse(raw);
-  if (!isRecord(value) || typeof value.type !== "string" || typeof value.data !== "string") {
-    throw new Error("--notification-display-code must be JSON with string fields type and data");
+  try {
+    const value = JSON.parse(raw);
+    if (!isRecord(value) || typeof value.type !== "string" || typeof value.data !== "string") {
+      throw new Error("expected string fields type and data");
+    }
+    return value as unknown as NotificationDisplayCode;
+  } catch (error) {
+    throw new AppError({
+      code: "FLAG_INVALID",
+      message: "--notification-display-code must be JSON with string fields type and data",
+      details: { reason: error instanceof Error ? error.message : String(error) }
+    });
   }
-  return value as unknown as NotificationDisplayCode;
 }
 
-function readFlagValue(args: string[], index: number, flag: string): string {
+function readFlagValue(args: string[], index: number, flagName: string): string {
   const value = args[index];
   if (!value || value.startsWith("--")) {
-    throw new Error(`${flag} requires a value`);
+    throw new AppError({
+      code: "FLAG_REQUIRED",
+      message: `${flagName} requires a value`,
+      details: { flag: flagName.replace(/^--/, "") }
+    });
   }
   return value;
 }
@@ -889,64 +1277,61 @@ async function readStdin(): Promise<string> {
   return Buffer.concat(chunks).toString("utf8");
 }
 
-function printJson(value: unknown): void {
-  console.log(JSON.stringify(value, null, 2));
+function nextStep(command: string[], requiredFlags: string[] = [], optionalFlags: string[] = [], hint?: string): NextStep {
+  return { command, requiredFlags, optionalFlags, hint };
 }
 
-function printUsage(): void {
-  console.log(`Usage:
-  cheqi init [--session <id>] [--currency EUR]
-  cheqi match [--session <id>] --card-par <par>
-  cheqi receipt set [--session <id>] --document-number <id> --currency <currency>
-  cheqi add-product [--session <id>] --name <name> --price-incl <amount> --vat <rate>
-  cheqi preview [--session <id>]
-  cheqi finalize-receipt [--session <id>]
-  cheqi receipts submit --match-by <type> --match-value <value> --receipt <file>
-  cheqi version
-
-Use --session for concurrent agent workflows. Sessions are stored in .cheqi/sessions.
-Run "cheqi receipt help" for session receipt commands.
-Run "cheqi receipts help" for direct JSON submission.`);
+function statusNextStep(session: Session): NextStep {
+  const productCount = Array.isArray(session.receipt.products) ? session.receipt.products.length : 0;
+  if (!session.identificationDetails) {
+    return nextStep(["session", "match"], ["session"], ["card-par", "pairing-code", "payment-account-identifier", "email"]);
+  }
+  if (productCount === 0) {
+    return nextStep(["receipt", "add-product"], ["session", "name"], ["price-incl", "unit-price", "vat"]);
+  }
+  return nextStep(["receipt", "validate"], ["session"]);
 }
 
-function printReceiptsUsage(): void {
-  console.log(`Usage:
-  cheqi receipts submit [flags]
-
-Run "cheqi receipts submit --help" for flags.`);
+function requiredFlag(name: string): AppError {
+  return new AppError({
+    code: "FLAG_REQUIRED",
+    message: `--${name} is required`,
+    details: { flag: name }
+  });
 }
 
-function printReceiptUsage(): void {
-  console.log(`Usage:
-  cheqi receipt set [--session <id>] --document-number INV-001 --currency EUR
-  cheqi receipt add-product [--session <id>] --name "Nike Shoes" --price-incl 200 --vat 21
-  cheqi receipt preview [--session <id>]
-  cheqi receipt finalize [--session <id>]
-
-Aliases:
-  cheqi add-product ...
-  cheqi preview
-  cheqi finalize-receipt`);
+function isHelp(args: string[]): boolean {
+  return args.length === 1 && (args[0] === "help" || args[0] === "-h" || args[0] === "--help");
 }
 
-function printSubmitUsage(): void {
-  console.log(`Usage:
-  cheqi receipts submit \\
-    --match-by card_par \\
-    --match-value YOUR_CARD_PAR \\
-    --receipt receipt.json
+function printEnvelope(ok: true, data: unknown, meta: Record<string, unknown>): void;
+function printEnvelope(ok: false, data: null, meta: Record<string, unknown>, error: AppError): void;
+function printEnvelope(ok: boolean, data: unknown, meta: Record<string, unknown>, error?: AppError): void {
+  if (ok) {
+    console.log(JSON.stringify({ ok: true, data, meta }, null, 2));
+    return;
+  }
 
-Flags:
-  --receipt <file>                      ReceiptTemplateRequest JSON file, or - for stdin
-  --match-by <type>                     card_par, pairing_code, payment_account_identifier, or email
-  --match-value <value>                 matching value
-  --api-key <key>                       API key, or CHEQI_API_KEY
-  --access-token <token>                OAuth access token, or CHEQI_ACCESS_TOKEN
-  --env <env>                           sandbox, test, or production; defaults to sandbox
-  --endpoint <url>                      custom API endpoint, or CHEQI_API_ENDPOINT
-  --timeout <seconds>                   request timeout; defaults to 30
-  --notification-display-code <json>    optional JSON object with type and data
-  --verbose                             enable sanitized SDK logs`);
+  console.log(JSON.stringify({
+    ok: false,
+    error: {
+      code: error?.code ?? "INPUT_INVALID",
+      message: error?.message ?? "Unknown error",
+      retryable: error?.retryable ?? false,
+      details: error?.details ?? undefined
+    },
+    meta
+  }, null, 2));
+}
+
+function normalizeError(error: unknown): AppError {
+  if (error instanceof AppError) {
+    return error;
+  }
+  return new AppError({
+    code: "INPUT_INVALID",
+    message: error instanceof Error ? error.message : String(error)
+  });
 }
 
 function env(name: string): string | null {
@@ -974,8 +1359,4 @@ function isNodeError(value: unknown): value is NodeJS.ErrnoException {
   return value instanceof Error && "code" in value;
 }
 
-main(process.argv.slice(2)).catch((error: unknown) => {
-  const message = error instanceof Error ? error.message : String(error);
-  console.error(`error: ${message}`);
-  process.exit(1);
-});
+main(process.argv.slice(2));
