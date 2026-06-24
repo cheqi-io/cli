@@ -9,16 +9,36 @@ import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
 const cli = resolve("dist/index.js");
 
-async function run(cwd, args) {
-  const result = await execFileAsync(process.execPath, [cli, ...args], { cwd });
-  return JSON.parse(result.stdout);
+async function run(cwd, args, options = {}) {
+  const result = await execFileAsync(process.execPath, [cli, ...args], {
+    cwd,
+    env: { ...process.env, ...options.env }
+  });
+  const envelope = JSON.parse(result.stdout);
+  assert.equal(envelope.ok, true);
+  return envelope.data;
 }
 
-test("session workflow builds an incremental receipt draft", async () => {
+async function runFailure(cwd, args, options = {}) {
+  try {
+    await execFileAsync(process.execPath, [cli, ...args], {
+      cwd,
+      env: { ...process.env, ...options.env }
+    });
+    assert.fail("expected command to fail");
+  } catch (error) {
+    const envelope = JSON.parse(error.stdout);
+    assert.equal(envelope.ok, false);
+    return envelope.error;
+  }
+}
+
+test("agentic session workflow builds an incremental receipt draft", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "cheqi-cli-session-"));
 
   const initResult = await run(cwd, [
-    "init",
+    "session",
+    "create",
     "--session",
     "agent-a",
     "--currency",
@@ -29,6 +49,7 @@ test("session workflow builds an incremental receipt draft", async () => {
     "par-123"
   ]);
   const addResult = await run(cwd, [
+    "receipt",
     "add-product",
     "--session",
     "agent-a",
@@ -39,24 +60,95 @@ test("session workflow builds an incremental receipt draft", async () => {
     "--vat",
     "21"
   ]);
-  const preview = await run(cwd, ["preview", "--session", "agent-a"]);
+  const validation = await run(cwd, ["receipt", "validate", "--session", "agent-a"]);
+  const preview = await run(cwd, ["receipt", "preview", "--session", "agent-a"]);
 
-  await run(cwd, ["init", "--session", "agent-b", "--currency", "EUR", "--document-number", "INV-002"]);
-  await run(cwd, ["add-product", "--session", "agent-b", "--name", "Socks", "--price-incl", "10", "--vat", "21"]);
-  const otherPreview = await run(cwd, ["preview", "--session", "agent-b"]);
+  await run(cwd, ["session", "create", "--session", "agent-b", "--currency", "EUR", "--document-number", "INV-002"]);
+  await run(cwd, ["receipt", "add-product", "--session", "agent-b", "--name", "Socks", "--price-incl", "10", "--vat", "21"]);
+  const otherPreview = await run(cwd, ["receipt", "preview", "--session", "agent-b"]);
 
   assert.equal(initResult.sessionId, "agent-a");
+  assert.deepEqual(initResult.nextStep.command, ["receipt", "add-product"]);
   assert.equal(addResult.added.name, "Nike Shoes");
   assert.equal(addResult.added.unitPrice, 165.29);
   assert.equal(addResult.totals.totalAmount, 200);
-  assert.equal(preview.identificationDetails.cardDetails.paymentAccountReference, "par-123");
-  assert.equal(preview.receipt.products.length, 1);
-  assert.equal(preview.receipt.taxes[0].amount, 34.71);
-  assert.equal(otherPreview.receipt.documentNumber, "INV-002");
-  assert.equal(otherPreview.receipt.products[0].name, "Socks");
+  assert.equal(validation.valid, true);
+  assert.deepEqual(validation.nextStep.command, ["receipt", "finalize"]);
+  assert.equal(preview.session.identificationDetails.cardDetails.paymentAccountReference, "par-123");
+  assert.equal(preview.session.receipt.products.length, 1);
+  assert.equal(preview.session.receipt.taxes[0].amount, 34.71);
+  assert.equal(otherPreview.session.receipt.documentNumber, "INV-002");
+  assert.equal(otherPreview.session.receipt.products[0].name, "Socks");
 
   const rawSession = await readFile(join(cwd, ".cheqi/sessions/agent-a.json"), "utf8");
   assert.equal(JSON.parse(rawSession).receipt.documentNumber, "INV-001");
-  const activeSession = await readFile(join(cwd, ".cheqi/active-session"), "utf8");
-  assert.equal(activeSession.trim(), "agent-b");
+});
+
+test("errors are structured JSON envelopes", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "cheqi-cli-error-"));
+  const error = await runFailure(cwd, ["receipt", "preview", "--session", "missing"]);
+
+  assert.equal(error.code, "SESSION_NOT_FOUND");
+  assert.equal(error.retryable, false);
+  assert.equal(error.details.sessionId, "missing");
+});
+
+test("schema is machine readable", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "cheqi-cli-schema-"));
+  const schema = await run(cwd, ["schema", "receipt", "validate"]);
+
+  assert.equal(schema.commands.length, 1);
+  assert.deepEqual(schema.commands[0].command, ["receipt", "validate"]);
+  assert.equal(schema.commands[0].flags[0].name, "session");
+  assert.equal(schema.commands[0].responseSchema.properties.valid.const, true);
+});
+
+test("schema includes positional arguments and response shapes", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "cheqi-cli-schema-shape-"));
+  const schema = await run(cwd, ["schema", "receipt", "add-product"]);
+  const command = schema.commands[0];
+
+  assert.deepEqual(command.command, ["receipt", "add-product"]);
+  assert.equal(command.positional[0].name, "name");
+  assert.equal(command.responseSchema.properties.added.type, "object");
+  assert.equal(command.responseSchema.properties.nextStep.properties.command.type, "array");
+});
+
+test("subcommand help returns schema", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "cheqi-cli-help-"));
+  const sessionSchema = await run(cwd, ["session", "--help"]);
+  const submitSchema = await run(cwd, ["receipts", "submit", "--help"]);
+
+  assert.deepEqual(sessionSchema.commands.map((command) => command.command[0]), ["session", "session", "session", "session"]);
+  assert.deepEqual(submitSchema.commands[0].command, ["receipts", "submit"]);
+});
+
+test("auth error codes are structured", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "cheqi-cli-auth-"));
+  const required = await runFailure(cwd, ["receipt", "finalize", "--session", "missing"]);
+  const conflict = await runFailure(cwd, [
+    "receipt",
+    "finalize",
+    "--session",
+    "missing",
+    "--api-key",
+    "sk_test",
+    "--access-token",
+    "token"
+  ]);
+
+  assert.equal(required.code, "AUTH_REQUIRED");
+  assert.equal(conflict.code, "AUTH_CONFLICT");
+});
+
+test("session create uses environment fallback", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "cheqi-cli-env-"));
+  await run(cwd, ["session", "create", "--session", "env-session"], {
+    env: { CHEQI_ENV: "test", CHEQI_API_ENDPOINT: "https://example.invalid" }
+  });
+
+  const rawSession = await readFile(join(cwd, ".cheqi/sessions/env-session.json"), "utf8");
+  const session = JSON.parse(rawSession);
+  assert.equal(session.auth.env, "test");
+  assert.equal(session.auth.endpoint, "https://example.invalid");
 });

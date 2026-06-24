@@ -2,33 +2,70 @@
 
 Agent-friendly CLI wrapper around `@cheqi/sdk`.
 
-## Submit A Receipt
+Every command returns a JSON envelope on stdout:
 
-### Incremental Session Workflow
+```json
+{
+  "ok": true,
+  "data": {},
+  "meta": {
+    "durationMs": 12,
+    "version": "0.2.0"
+  }
+}
+```
+
+Failures use the same shape and include stable error codes:
+
+```json
+{
+  "ok": false,
+  "error": {
+    "code": "SESSION_NOT_FOUND",
+    "message": "No Cheqi session found for agent-a. Run cheqi session create --session agent-a first.",
+    "retryable": false,
+    "details": {
+      "sessionId": "agent-a"
+    }
+  },
+  "meta": {
+    "durationMs": 4,
+    "version": "0.2.0"
+  }
+}
+```
+
+## Incremental Session Workflow
 
 ```bash
-CHEQI_API_KEY=sk_test_... cheqi init --session agent-a --currency EUR --document-number INV-001
-CHEQI_API_KEY=sk_test_... cheqi match --session agent-a --card-par 5001DIACKX3POWK6FCWW3X8792ISP
+cheqi session create \
+  --session agent-a \
+  --currency EUR \
+  --document-number INV-001 \
+  --card-par 5001DIACKX3POWK6FCWW3X8792ISP
 
-cheqi add-product \
+cheqi receipt add-product \
   --session agent-a \
   --name "Nike Shoes" \
   --price-incl 200 \
   --vat 21
 
-cheqi preview --session agent-a
-CHEQI_API_KEY=sk_test_... cheqi finalize-receipt --session agent-a
+cheqi receipt validate --session agent-a
+cheqi receipt preview --session agent-a
+CHEQI_API_KEY=sk_test_... cheqi receipt finalize --session agent-a
 ```
 
-Drafts are stored locally in `.cheqi/sessions/<session-id>.json`. The latest initialized or matched session is also written to `.cheqi/active-session`, so `--session` is optional for single-user flows. For multiple agents in the same working directory, pass a unique `--session` on every command.
+Drafts are stored locally in `.cheqi/sessions/<session-id>.json`. Sessions are always explicit; pass `--session` on every command so concurrent agents do not share implicit state.
 
-You can also initialize with match details in one step when you do not need to call matching immediately:
+To call the Cheqi matching service before adding products:
 
 ```bash
-cheqi init --session agent-a --currency EUR --document-number INV-001 --card-par 5001DIACKX3POWK6FCWW3X8792ISP
+CHEQI_API_KEY=sk_test_... cheqi session match \
+  --session agent-a \
+  --card-par 5001DIACKX3POWK6FCWW3X8792ISP
 ```
 
-### Direct JSON Workflow
+## Direct JSON Workflow
 
 ```bash
 CHEQI_API_KEY=sk_test_... npx @cheqi/cli receipts submit \
@@ -37,7 +74,30 @@ CHEQI_API_KEY=sk_test_... npx @cheqi/cli receipts submit \
   --receipt receipt.json
 ```
 
-The CLI performs matching, template generation, local encryption, and encrypted submission through the TypeScript SDK.
+Use `--receipt -` to read the receipt JSON from stdin.
+
+## Machine-Readable Schema
+
+Agents can discover commands, flags, valid enum values, and response names without parsing human help text:
+
+```bash
+cheqi schema
+cheqi schema receipt validate
+cheqi receipt add-product --help
+```
+
+Schema entries include `flags`, `positional`, and `responseSchema` so an agent can construct commands and validate expected output without probing the command first.
+
+Operational responses include a structured `nextStep` when another command is expected:
+
+```json
+{
+  "command": ["receipt", "validate"],
+  "requiredFlags": ["session"],
+  "optionalFlags": [],
+  "hint": "Validate locally before finalizing."
+}
+```
 
 ## Authentication
 
@@ -59,12 +119,12 @@ Do not set both for the same command.
 
 The GitHub Actions `Publish npm package` workflow publishes `@cheqi/cli` to npm. Run it manually with:
 
-- `version`: the package version to publish, for example `0.1.1`
+- `version`: the package version to publish, for example `0.2.0`
 - `dist-tag`: `latest` or `next`
 
 Before the CLI can be published, `@cheqi/sdk` must already exist on npm at a compatible version. Configure the repository secret `NPM_TOKEN` with publish access for the `@cheqi/cli` package.
 
 ```bash
 npm view @cheqi/sdk@0.1.1 version
-npm view @cheqi/cli@0.1.1 version
+npm view @cheqi/cli@0.2.0 version
 ```
