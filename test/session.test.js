@@ -141,6 +141,48 @@ test("auth error codes are structured", async () => {
   assert.equal(conflict.code, "AUTH_CONFLICT");
 });
 
+test("verbose mode keeps stdout pure JSON and routes SDK logs to stderr", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "cheqi-cli-verbose-"));
+  await run(cwd, ["session", "create", "--session", "v1"]);
+
+  // --verbose builds the SDK (which emits diagnostics). Point at an unreachable
+  // endpoint so the request fails fast and deterministically.
+  let stdout;
+  let stderr;
+  try {
+    const result = await execFileAsync(
+      process.execPath,
+      [
+        cli,
+        "session",
+        "match",
+        "--session",
+        "v1",
+        "--email",
+        "a@b.com",
+        "--verbose",
+        "--endpoint",
+        "http://127.0.0.1:1",
+        "--api-key",
+        "sk_test_x",
+        "--timeout",
+        "2"
+      ],
+      { cwd }
+    );
+    ({ stdout, stderr } = result);
+  } catch (error) {
+    ({ stdout, stderr } = error);
+  }
+
+  // stdout must remain a single parseable JSON envelope — no interleaved logs.
+  const envelope = JSON.parse(stdout);
+  assert.equal(envelope.ok, false);
+  // SDK diagnostics must appear on stderr, not stdout.
+  assert.match(stderr, /CheqiSDK/);
+  assert.doesNotMatch(stdout, /CheqiSDK/);
+});
+
 test("session create uses environment fallback", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "cheqi-cli-env-"));
   await run(cwd, ["session", "create", "--session", "env-session"], {

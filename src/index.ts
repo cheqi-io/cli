@@ -6,13 +6,38 @@ import {
   CheqiSDK,
   Environment,
   NoopLogger,
-  ConsoleLogger,
+  type Logger,
   type IdentificationDetails,
   type NotificationDisplayCode
 } from "@cheqi/sdk";
 
 const VERSION = "0.2.0";
 const SESSIONS_DIR = ".cheqi/sessions";
+
+/**
+ * Logger that writes every level to stderr, keeping stdout reserved exclusively
+ * for the machine-readable JSON envelope. Used when --verbose is set so that
+ * SDK diagnostics never corrupt the parsed output for agentic consumers.
+ *
+ * (The SDK's built-in ConsoleLogger sends info/debug to stdout, which would
+ * interleave log lines into the JSON envelope.)
+ */
+class StderrLogger implements Logger {
+  constructor(private readonly prefix: string = "CheqiSDK") {}
+
+  debug(message: string, ...args: unknown[]): void {
+    console.error(`[${this.prefix}] ${message}`, ...args);
+  }
+  info(message: string, ...args: unknown[]): void {
+    console.error(`[${this.prefix}] ${message}`, ...args);
+  }
+  warn(message: string, ...args: unknown[]): void {
+    console.error(`[${this.prefix}] ${message}`, ...args);
+  }
+  error(message: string, ...args: unknown[]): void {
+    console.error(`[${this.prefix}] ${message}`, ...args);
+  }
+}
 
 type ErrorCode =
   | "AUTH_REQUIRED"
@@ -483,7 +508,7 @@ async function submitReceipt(args: string[]): Promise<unknown> {
   const sdk = CheqiSDK.builder()
     .apiEndpoint(resolveEndpoint(options))
     .timeoutSeconds(options.timeoutSeconds)
-    .logger(options.verbose ? new ConsoleLogger() : new NoopLogger());
+    .logger(options.verbose ? new StderrLogger() : new NoopLogger());
 
   if (options.apiKey) {
     sdk.apiKey(options.apiKey);
@@ -900,7 +925,7 @@ function buildSDK(options: AuthOptions) {
   const builder = CheqiSDK.builder()
     .apiEndpoint(resolveEndpoint(options))
     .timeoutSeconds(options.timeoutSeconds)
-    .logger(options.verbose ? new ConsoleLogger() : new NoopLogger());
+    .logger(options.verbose ? new StderrLogger() : new NoopLogger());
 
   if (options.apiKey) {
     builder.apiKey(options.apiKey);
