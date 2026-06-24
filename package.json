@@ -1,6 +1,6 @@
 {
   "name": "@cheqi/cli",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Cheqi CLI for agent-friendly encrypted receipt workflows",
   "license": "MIT",
   "author": "Cheqi",
@@ -34,11 +34,11 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run build && node ./dist/index.js help && node ./dist/index.js receipts help && node --test test/*.test.js",
+    "test": "npm run build && node ./dist/index.js schema session create > /dev/null && node ./dist/index.js schema receipts submit > /dev/null && node --test test/*.test.js",
     "prepublishOnly": "npm test"
   },
   "dependencies": {
-    "@cheqi/sdk": "^0.1.1"
+    "@cheqi/sdk": "^0.1.2"
   },
   "devDependencies": {
     "@types/node": "^25.5.0",
