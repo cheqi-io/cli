@@ -488,6 +488,7 @@ async function finalizeSession(args: string[]): Promise<unknown> {
     cheqiReceiptId: typeof response?.cheqiReceiptId === "string" ? response.cheqiReceiptId : undefined,
     createdAt: typeof response?.createdAt === "string" ? response.createdAt : undefined,
     templateHash: typeof response?.templateHash === "string" ? response.templateHash : undefined,
+    downloadUrl: result.downloadUrl ?? undefined,
     response: result.response,
     message: result.message,
     sessionId: session.id,
@@ -537,6 +538,7 @@ async function submitReceipt(args: string[]): Promise<unknown> {
     cheqiReceiptId: typeof response?.cheqiReceiptId === "string" ? response.cheqiReceiptId : undefined,
     createdAt: typeof response?.createdAt === "string" ? response.createdAt : undefined,
     templateHash: typeof response?.templateHash === "string" ? response.templateHash : undefined,
+    downloadUrl: result.downloadUrl ?? undefined,
     response: result.response,
     message: result.message,
     customerEmail: result.customerEmail
@@ -772,6 +774,7 @@ function responseSchema(name: string): Record<string, unknown> {
         cheqiReceiptId: { type: "string" },
         createdAt: { type: "string", format: "date-time" },
         templateHash: { type: "string" },
+        downloadUrl: { type: "string" },
         response: { type: ["object", "array", "string", "number", "boolean", "null"] },
         message: { type: "string" },
         customerEmail: { type: "string" },
