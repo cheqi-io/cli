@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { createServer } from "node:http";
 
 const execFileAsync = promisify(execFile);
 const cli = resolve("dist/index.js");
@@ -91,6 +92,130 @@ test("errors are structured JSON envelopes", async () => {
   assert.equal(error.code, "SESSION_NOT_FOUND");
   assert.equal(error.retryable, false);
   assert.equal(error.details.sessionId, "missing");
+});
+
+test("empty identification details are accepted for download-link receipts", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "cheqi-cli-empty-identification-"));
+
+  const initResult = await run(cwd, [
+    "session",
+    "create",
+    "--session",
+    "download-link",
+    "--currency",
+    "EUR",
+    "--document-number",
+    "INV-DOWNLOAD",
+    "--card-par",
+    ""
+  ]);
+  await run(cwd, [
+    "receipt",
+    "add-product",
+    "--session",
+    "download-link",
+    "--name",
+    "Socks",
+    "--price-incl",
+    "10",
+    "--vat",
+    "21"
+  ]);
+  const validation = await run(cwd, ["receipt", "validate", "--session", "download-link"]);
+  const preview = await run(cwd, ["receipt", "preview", "--session", "download-link"]);
+  const status = await run(cwd, ["session", "status", "--session", "download-link"]);
+
+  assert.equal(initResult.hasMatch, true);
+  assert.deepEqual(initResult.nextStep.command, ["receipt", "add-product"]);
+  assert.equal(validation.valid, true);
+  assert.deepEqual(preview.session.identificationDetails, {});
+  assert.equal(status.hasMatch, true);
+  assert.deepEqual(status.nextStep.command, ["receipt", "validate"]);
+});
+
+test("empty session match stores empty identification details without calling matching", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "cheqi-cli-empty-match-"));
+  await run(cwd, ["session", "create", "--session", "empty-match"]);
+
+  const match = await run(cwd, [
+    "session",
+    "match",
+    "--session",
+    "empty-match",
+    "--card-par",
+    "",
+    "--api-key",
+    "sk_test_x"
+  ]);
+  const preview = await run(cwd, ["receipt", "preview", "--session", "empty-match"]);
+
+  assert.equal(match.customerFound, false);
+  assert.equal(match.recipientCount, 0);
+  assert.deepEqual(preview.session.identificationDetails, {});
+  assert.equal(preview.session.matchResponse, null);
+});
+
+test("finalize sends empty identification details to matching API for download fallback", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "cheqi-cli-empty-finalize-"));
+  const requests = [];
+  const server = createServer((req, res) => {
+    let body = "";
+    req.on("data", (chunk) => {
+      body += chunk;
+    });
+    req.on("end", () => {
+      requests.push({ url: req.url, body: body ? JSON.parse(body) : null });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ routeFound: false, customerFound: false, recipients: [] }));
+    });
+  });
+  await new Promise((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+  const address = server.address();
+  assert.equal(typeof address, "object");
+  const endpoint = `http://127.0.0.1:${address.port}`;
+
+  try {
+    await run(cwd, [
+      "session",
+      "create",
+      "--session",
+      "empty-finalize",
+      "--card-par",
+      ""
+    ]);
+    await run(cwd, [
+      "receipt",
+      "add-product",
+      "--session",
+      "empty-finalize",
+      "--name",
+      "Socks",
+      "--price-incl",
+      "10",
+      "--vat",
+      "21"
+    ]);
+    const result = await run(cwd, [
+      "receipt",
+      "finalize",
+      "--session",
+      "empty-finalize",
+      "--api-key",
+      "sk_test_x",
+      "--endpoint",
+      endpoint,
+      "--timeout",
+      "2"
+    ]);
+
+    assert.equal(result.customerFound, false);
+    assert.equal(requests[0].url, "/recipient/resolve");
+    assert.deepEqual(requests[0].body, {});
+  } finally {
+    await new Promise((resolveClose, rejectClose) => {
+      server.close((error) => error ? rejectClose(error) : resolveClose());
+    });
+  }
 });
 
 test("schema is machine readable", async () => {
