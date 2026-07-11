@@ -276,7 +276,7 @@ async function createSession(args: string[]): Promise<unknown> {
   };
 
   const match = identificationDetailsFromFlags(flags);
-  if (match) {
+  if (match !== null) {
     session.identificationDetails = match as unknown as Record<string, unknown>;
   }
 
@@ -285,8 +285,8 @@ async function createSession(args: string[]): Promise<unknown> {
     sessionId: session.id,
     session: sessionPath(session.id),
     receipt: session.receipt,
-    hasMatch: Boolean(session.identificationDetails),
-    nextStep: session.identificationDetails
+    hasMatch: hasIdentificationDetails(session),
+    nextStep: hasIdentificationDetails(session)
       ? nextStep(["receipt", "add-product"], ["session", "name"], ["price-incl", "unit-price", "vat"], "Add at least one product before validation or finalization.")
       : nextStep(["session", "match"], ["session"], ["card-par", "pairing-code", "payment-account-identifier", "email"], "Match the customer before finalizing the receipt.")
   };
@@ -298,7 +298,7 @@ async function matchSession(args: string[]): Promise<unknown> {
   validateAuth(auth);
 
   const identificationDetails = identificationDetailsFromFlags(flags);
-  if (!identificationDetails) {
+  if (identificationDetails === null) {
     throw new AppError({
       code: "FLAG_REQUIRED",
       message: "Provide one match flag: --card-par, --pairing-code, --payment-account-identifier, or --email",
@@ -311,20 +311,24 @@ async function matchSession(args: string[]): Promise<unknown> {
   session.auth.env = auth.env;
   session.auth.endpoint = auth.endpoint;
 
-  const sdk = buildSDK(auth).build();
-  session.matchResponse = await sdk.matchingService.matchCustomer(
-    identificationDetails,
-    auth.accessToken
-  ) as Record<string, unknown>;
+  if (hasIdentificationIdentifiers(identificationDetails as unknown as Record<string, unknown>)) {
+    const sdk = buildSDK(auth).build();
+    session.matchResponse = await sdk.matchingService.matchCustomer(
+      identificationDetails,
+      auth.accessToken
+    ) as Record<string, unknown>;
+  } else {
+    session.matchResponse = null;
+  }
   touch(session);
   await saveSession(session);
 
   return {
     sessionId: session.id,
     session: sessionPath(session.id),
-    customerFound: session.matchResponse.customerFound,
-    matchId: session.matchResponse.matchId,
-    recipientCount: Array.isArray(session.matchResponse.recipients) ? session.matchResponse.recipients.length : 0,
+    customerFound: session.matchResponse?.customerFound ?? false,
+    matchId: session.matchResponse?.matchId,
+    recipientCount: Array.isArray(session.matchResponse?.recipients) ? session.matchResponse.recipients.length : 0,
     nextStep: nextStep(["receipt", "add-product"], ["session", "name"], ["price-incl", "unit-price", "vat"], "Add product lines before validation or finalization.")
   };
 }
@@ -437,7 +441,7 @@ async function statusSession(args: string[]): Promise<unknown> {
   return {
     sessionId: session.id,
     session: sessionPath(session.id),
-    hasMatch: Boolean(session.identificationDetails),
+    hasMatch: hasIdentificationDetails(session),
     hasMatchResponse: Boolean(session.matchResponse),
     productCount: Array.isArray(session.receipt.products) ? session.receipt.products.length : 0,
     totals: totals(session.receipt),
@@ -861,7 +865,7 @@ function parseSubmitOptions(args: string[]): SubmitOptions {
         options.matchBy = readFlagValue(args, ++index, arg);
         break;
       case "--match-value":
-        options.matchValue = readFlagValue(args, ++index, arg);
+        options.matchValue = readPossiblyEmptyFlagValue(args, ++index, arg);
         break;
       case "--timeout":
         options.timeoutSeconds = parsePositiveInt(readFlagValue(args, ++index, arg), 30);
@@ -891,7 +895,7 @@ function validateSubmitOptions(options: SubmitOptions): void {
   if (!options.matchBy) {
     throw requiredFlag("match-by");
   }
-  if (!options.matchValue) {
+  if (options.matchValue === null) {
     throw requiredFlag("match-value");
   }
   validateAuth(options);
@@ -1055,25 +1059,29 @@ function booleanFlag(flags: Flags, name: string): boolean {
 
 function identificationDetailsFromFlags(flags: Flags): IdentificationDetails | null {
   const cardPar = stringFlag(flags, "card-par") ?? stringFlag(flags, "cardPar");
-  if (cardPar) {
+  if (cardPar !== null) {
     return buildIdentificationDetails("card_par", cardPar);
   }
 
   const pairingCode = stringFlag(flags, "pairing-code") ?? stringFlag(flags, "pairingCode");
-  if (pairingCode) {
+  if (pairingCode !== null) {
     return buildIdentificationDetails("pairing_code", pairingCode);
   }
 
   const paymentAccountIdentifier = stringFlag(flags, "payment-account-identifier")
     ?? stringFlag(flags, "paymentAccountIdentifier")
     ?? stringFlag(flags, "iban");
-  if (paymentAccountIdentifier) {
+  if (paymentAccountIdentifier !== null) {
     return buildIdentificationDetails("payment_account_identifier", paymentAccountIdentifier);
   }
 
   const email = stringFlag(flags, "email");
-  if (email) {
+  if (email !== null) {
     return buildIdentificationDetails("email", email);
+  }
+
+  if (hasAnyFlag(flags, ["card-par", "cardPar", "pairing-code", "pairingCode", "payment-account-identifier", "paymentAccountIdentifier", "iban", "email"])) {
+    return {} as IdentificationDetails;
   }
 
   return null;
@@ -1191,7 +1199,7 @@ function totals(receipt: Record<string, unknown>): Record<string, unknown> {
 }
 
 function validateReadyToFinalize(session: Session): void {
-  if (!session.identificationDetails) {
+  if (!hasIdentificationDetails(session)) {
     throw new AppError({
       code: "RECEIPT_INVALID",
       message: "No match details in the session. Run cheqi session match first.",
@@ -1236,6 +1244,10 @@ function numberValue(value: unknown): number {
 }
 
 function buildIdentificationDetails(matchBy: string, value: string): IdentificationDetails {
+  if (value.trim() === "") {
+    return {} as IdentificationDetails;
+  }
+
   switch (normalize(matchBy)) {
     case "card_par":
       return {
@@ -1297,6 +1309,18 @@ function readFlagValue(args: string[], index: number, flagName: string): string 
   return value;
 }
 
+function readPossiblyEmptyFlagValue(args: string[], index: number, flagName: string): string {
+  const value = args[index];
+  if (value === undefined || value.startsWith("--")) {
+    throw new AppError({
+      code: "FLAG_REQUIRED",
+      message: `${flagName} requires a value`,
+      details: { flag: flagName.replace(/^--/, "") }
+    });
+  }
+  return value;
+}
+
 async function readStdin(): Promise<string> {
   const chunks: Buffer[] = [];
   for await (const chunk of stdin) {
@@ -1311,7 +1335,7 @@ function nextStep(command: string[], requiredFlags: string[] = [], optionalFlags
 
 function statusNextStep(session: Session): NextStep {
   const productCount = Array.isArray(session.receipt.products) ? session.receipt.products.length : 0;
-  if (!session.identificationDetails) {
+  if (!hasIdentificationDetails(session)) {
     return nextStep(["session", "match"], ["session"], ["card-par", "pairing-code", "payment-account-identifier", "email"]);
   }
   if (productCount === 0) {
@@ -1326,6 +1350,27 @@ function requiredFlag(name: string): AppError {
     message: `--${name} is required`,
     details: { flag: name }
   });
+}
+
+function hasIdentificationDetails(session: Session): boolean {
+  return session.identificationDetails !== null;
+}
+
+function hasAnyFlag(flags: Flags, names: string[]): boolean {
+  return names.some((name) => Object.prototype.hasOwnProperty.call(flags, name));
+}
+
+function hasIdentificationIdentifiers(details: Record<string, unknown>): boolean {
+  const cardDetails = isRecord(details.cardDetails) ? details.cardDetails : {};
+  const paymentAccountDetails = isRecord(details.paymentAccountDetails) ? details.paymentAccountDetails : {};
+  return [
+    cardDetails.paymentAccountNumber,
+    cardDetails.paymentAccountReference,
+    paymentAccountDetails.identifier,
+    details.recipientEmail,
+    details.cheqiReceiptId,
+    details.pairingCode
+  ].some((value) => typeof value === "string" && value.trim() !== "");
 }
 
 function isHelp(args: string[]): boolean {
