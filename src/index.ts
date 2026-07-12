@@ -1,17 +1,25 @@
 #!/usr/bin/env node
 
+import { createHash } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { stdin } from "node:process";
 import {
   CheqiSDK,
+  CheqiSDKError,
   Environment,
   NoopLogger,
+  type ReceiptResult,
   type Logger,
   type IdentificationDetails,
   type NotificationDisplayCode
 } from "@cheqi/sdk";
+import {
+  buildDownloadEnvelope,
+  encryptDownloadEnvelope,
+  parseDownloadUrl
+} from "@cheqi/sdk/download";
 
-const VERSION = "0.2.0";
+const VERSION = "0.3.0";
 const SESSIONS_DIR = ".cheqi/sessions";
 
 /**
@@ -83,6 +91,7 @@ interface SubmitOptions {
   accessToken: string | null;
   env: string;
   endpoint: string | null;
+  downloadBaseUrl: string | null;
   receiptPath: string | null;
   matchBy: string | null;
   matchValue: string | null;
@@ -96,8 +105,20 @@ interface AuthOptions {
   accessToken: string | null;
   env: string;
   endpoint: string | null;
+  downloadBaseUrl: string | null;
   timeoutSeconds: number;
   verbose: boolean;
+}
+
+interface SubmitDownloadOptions extends AuthOptions {
+  receiptPath: string | null;
+  downloadUrl: string | null;
+  ciphertext: string | null;
+  templateHash: string | null;
+  buyerType: "CONSUMER" | "BUSINESS";
+  buyerCountryCode: string | null;
+  taxesApplied: boolean;
+  formats: string[];
 }
 
 interface Session {
@@ -229,6 +250,9 @@ async function receiptsCommand(args: string[]): Promise<unknown> {
     case "submit":
       if (isHelp(rest)) return commandSchema(["receipts", "submit"]);
       return submitReceipt(rest);
+    case "submit-download":
+      if (isHelp(rest)) return commandSchema(["receipts", "submit-download"]);
+      return submitDownloadReceipt(rest);
     case "help":
     case "-h":
     case "--help":
@@ -483,18 +507,8 @@ async function finalizeSession(args: string[]): Promise<unknown> {
     null
   );
 
-  const response = isRecord(result.response) ? result.response : null;
   return {
-    success: result.success,
-    deliveryMethod: result.deliveryMethod,
-    customerFound: result.customerFound,
-    receiptCount: result.receiptCount,
-    cheqiReceiptId: typeof response?.cheqiReceiptId === "string" ? response.cheqiReceiptId : undefined,
-    createdAt: typeof response?.createdAt === "string" ? response.createdAt : undefined,
-    templateHash: typeof response?.templateHash === "string" ? response.templateHash : undefined,
-    downloadUrl: result.downloadUrl ?? undefined,
-    response: result.response,
-    message: result.message,
+    ...receiptResultData(result),
     sessionId: session.id,
     session: sessionPath(session.id)
   };
@@ -510,10 +524,7 @@ async function submitReceipt(args: string[]): Promise<unknown> {
   const options = parseSubmitOptions(args);
   validateSubmitOptions(options);
 
-  const sdk = CheqiSDK.builder()
-    .apiEndpoint(resolveEndpoint(options))
-    .timeoutSeconds(options.timeoutSeconds)
-    .logger(options.verbose ? new StderrLogger() : new NoopLogger());
+  const sdk = buildSDK(options);
 
   if (options.apiKey) {
     sdk.apiKey(options.apiKey);
@@ -533,20 +544,282 @@ async function submitReceipt(args: string[]): Promise<unknown> {
     options.notificationDisplayCode
   );
 
+  return {
+    ...receiptResultData(result),
+    customerEmail: result.customerEmail
+  };
+}
+
+// Public receipt-download page per environment (Download Link Contract v1).
+const DOWNLOAD_BASE_URLS: Record<string, string> = {
+  sandbox: "https://sandbox.receipt.cheqi.io",
+  test: "https://test.receipt.cheqi.io",
+  production: "https://receipt.cheqi.io",
+  prod: "https://receipt.cheqi.io"
+};
+
+function resolveDownloadBaseUrl(options: Pick<SubmitDownloadOptions, "downloadBaseUrl" | "env">): string {
+  if (options.downloadBaseUrl) {
+    return options.downloadBaseUrl;
+  }
+  const baseUrl = DOWNLOAD_BASE_URLS[normalize(options.env)];
+  if (!baseUrl) {
+    throw new AppError({
+      code: "ENV_UNSUPPORTED",
+      message: `No receipt download base URL for environment: ${options.env}. Pass --download-base-url.`,
+      details: { env: options.env, supported: ["sandbox", "test", "production"] }
+    });
+  }
+  return baseUrl;
+}
+
+function receiptResultData(result: ReceiptResult): Record<string, unknown> {
   const response = isRecord(result.response) ? result.response : null;
+  const downloadId = result.downloadUrl ? parseDownloadUrl(result.downloadUrl).downloadId : undefined;
   return {
     success: result.success,
     deliveryMethod: result.deliveryMethod,
+    deliveryStatus: result.deliveryStatus,
     customerFound: result.customerFound,
     receiptCount: result.receiptCount,
     cheqiReceiptId: typeof response?.cheqiReceiptId === "string" ? response.cheqiReceiptId : undefined,
-    createdAt: typeof response?.createdAt === "string" ? response.createdAt : undefined,
-    templateHash: typeof response?.templateHash === "string" ? response.templateHash : undefined,
+    createdAt: response?.createdAt,
+    templateHash: result.templateHash ?? response?.templateHash,
+    canonicalJson: result.canonicalJson ?? undefined,
     downloadUrl: result.downloadUrl ?? undefined,
+    downloadId,
+    downloadCiphertext: result.downloadCiphertext ?? undefined,
     response: result.response,
     message: result.message,
     customerEmail: result.customerEmail
   };
+}
+
+/**
+ * Issues a receipt via a client-generated, end-to-end-encrypted download link
+ * (Download Link Contract v1): the download id and AES key are generated locally, the
+ * envelope is encrypted client-side, and the server stores ciphertext it can never
+ * decrypt. No customer matching is involved. The returned downloadUrl carries the key
+ * in its #fragment — hand it to the customer (QR); do not log it server-side.
+ */
+async function submitDownloadReceipt(args: string[]): Promise<unknown> {
+  const options = parseSubmitDownloadOptions(args);
+  if (!options.receiptPath) {
+    throw requiredFlag("receipt");
+  }
+  validateAuth(options);
+
+  // Deferred-download scheduling belongs to the caller. A single failed request should
+  // return the customer URL promptly instead of consuming the SDK's normal retry budget.
+  const sdk = buildSDK(options).maxRetries(0).build();
+  const receipt = await readReceipt(options.receiptPath);
+
+  if (!options.downloadUrl && !options.ciphertext) {
+    const result = await sdk.receiptService.processCompleteReceipt({}, receipt as never, options.accessToken);
+    return receiptResultData(result);
+  }
+
+  if (!options.downloadUrl) {
+    throw requiredFlag("download-url");
+  }
+  const link = { ...parseDownloadUrl(options.downloadUrl), url: options.downloadUrl };
+
+  if (options.ciphertext) {
+    if (!options.templateHash) {
+      throw requiredFlag("template-hash");
+    }
+    return uploadDownloadReceipt(sdk, options, link, options.ciphertext, options.templateHash);
+  }
+
+  // No match session exists on this route, so the buyer/VAT context the online flow
+  // derives from the match response must be supplied explicitly.
+  let template;
+  try {
+    template = await sdk.receiptService.generateReceiptTemplate(
+      {
+        receiptTemplateRequest: receipt,
+        formats: options.formats,
+        buyerType: options.buyerType,
+        buyerCountryCode: options.buyerCountryCode ?? undefined,
+        taxesApplied: options.taxesApplied
+      } as never,
+      options.accessToken
+    );
+  } catch (error) {
+    if (!isRetryableSdkFailure(error)) {
+      throw error;
+    }
+    return pendingDownloadResult("PENDING_DOWNLOAD_TEMPLATE", link, error);
+  }
+  if (!template.cheqi) {
+    throw new AppError({
+      code: "RECEIPT_INVALID",
+      message: "Template generation returned no CHEQI receipt to encrypt"
+    });
+  }
+
+  const envelope = buildDownloadEnvelope(template);
+
+  // Encrypt once; the exact bytes are what the endpoint is idempotent on.
+  const ciphertext = await encryptDownloadEnvelope(envelope, link.contentKey);
+  const templateHash = createHash("sha256").update(JSON.stringify(template.cheqi)).digest("hex");
+
+  return uploadDownloadReceipt(sdk, options, link, ciphertext, templateHash);
+}
+
+async function uploadDownloadReceipt(
+  sdk: CheqiSDK,
+  options: SubmitDownloadOptions,
+  link: { downloadId: string; contentKey: string; url: string },
+  ciphertext: string,
+  templateHash: string
+): Promise<unknown> {
+  let response;
+  try {
+    response = await sdk.receiptService.uploadClientEncryptedReceipt(
+      { downloadId: link.downloadId, ciphertext, templateHash },
+      options.accessToken
+    );
+  } catch (error) {
+    if (!isRetryableSdkFailure(error)) {
+      throw error;
+    }
+    return pendingDownloadResult("PENDING_DOWNLOAD_UPLOAD", link, error, { ciphertext, templateHash });
+  }
+
+  return {
+    success: true,
+    deliveryMethod: "DOWNLOAD",
+    deliveryStatus: "DELIVERED_DOWNLOAD",
+    downloadUrl: link.url,
+    downloadId: link.downloadId,
+    cheqiReceiptId: response.cheqiReceiptId,
+    createdAt: response.createdAt,
+    expiresAt: response.expiresAt,
+    templateHash
+  };
+}
+
+function pendingDownloadResult(
+  deliveryStatus: "PENDING_DOWNLOAD_TEMPLATE" | "PENDING_DOWNLOAD_UPLOAD",
+  link: { downloadId: string; url: string },
+  error: unknown,
+  retry: { ciphertext: string; templateHash: string } | null = null
+): Record<string, unknown> {
+  return {
+    success: true,
+    deliveryMethod: "DOWNLOAD",
+    deliveryStatus,
+    downloadUrl: link.url,
+    downloadId: link.downloadId,
+    retryable: true,
+    retry: retry ?? undefined,
+    pendingReason: error instanceof Error ? error.message : String(error)
+  };
+}
+
+function isRetryableSdkFailure(error: unknown): boolean {
+  if (!(error instanceof CheqiSDKError)) {
+    return false;
+  }
+  return error.isNetworkError() || error.isRateLimitError() || error.isServerError();
+}
+
+function parseSubmitDownloadOptions(args: string[]): SubmitDownloadOptions {
+  const options: SubmitDownloadOptions = {
+    apiKey: env("CHEQI_API_KEY"),
+    accessToken: env("CHEQI_ACCESS_TOKEN"),
+    env: env("CHEQI_ENV") ?? "sandbox",
+    endpoint: env("CHEQI_API_ENDPOINT"),
+    receiptPath: null,
+    downloadBaseUrl: env("CHEQI_DOWNLOAD_BASE_URL"),
+    downloadUrl: null,
+    ciphertext: null,
+    templateHash: null,
+    buyerType: "CONSUMER",
+    buyerCountryCode: null,
+    taxesApplied: true,
+    formats: ["CHEQI"],
+    timeoutSeconds: parsePositiveInt(env("CHEQI_TIMEOUT_SECONDS"), 30),
+    verbose: false
+  };
+
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index];
+    switch (arg) {
+      case "--api-key":
+        options.apiKey = readFlagValue(args, ++index, arg);
+        break;
+      case "--access-token":
+        options.accessToken = readFlagValue(args, ++index, arg);
+        break;
+      case "--env":
+        options.env = readFlagValue(args, ++index, arg);
+        break;
+      case "--endpoint":
+        options.endpoint = readFlagValue(args, ++index, arg);
+        break;
+      case "--receipt":
+        options.receiptPath = readFlagValue(args, ++index, arg);
+        break;
+      case "--download-base-url":
+        options.downloadBaseUrl = readFlagValue(args, ++index, arg);
+        break;
+      case "--download-url":
+        options.downloadUrl = readFlagValue(args, ++index, arg);
+        break;
+      case "--ciphertext":
+        options.ciphertext = readFlagValue(args, ++index, arg);
+        break;
+      case "--template-hash":
+        options.templateHash = readFlagValue(args, ++index, arg);
+        break;
+      case "--buyer-type": {
+        const value = readFlagValue(args, ++index, arg).toUpperCase();
+        if (value !== "CONSUMER" && value !== "BUSINESS") {
+          throw new AppError({
+            code: "FLAG_INVALID",
+            message: "--buyer-type must be CONSUMER or BUSINESS",
+            details: { flag: arg, value }
+          });
+        }
+        options.buyerType = value;
+        break;
+      }
+      case "--buyer-country":
+        options.buyerCountryCode = readFlagValue(args, ++index, arg);
+        break;
+      case "--formats":
+        options.formats = readFlagValue(args, ++index, arg).split(",").map((format) => format.trim().toUpperCase());
+        break;
+      case "--taxes-applied": {
+        const value = readFlagValue(args, ++index, arg).toLowerCase();
+        if (value !== "true" && value !== "false") {
+          throw new AppError({
+            code: "FLAG_INVALID",
+            message: "--taxes-applied must be true or false",
+            details: { flag: arg, value }
+          });
+        }
+        options.taxesApplied = value === "true";
+        break;
+      }
+      case "--timeout":
+        options.timeoutSeconds = parsePositiveInt(readFlagValue(args, ++index, arg), 30);
+        break;
+      case "--verbose":
+        options.verbose = true;
+        break;
+      default:
+        throw new AppError({
+          code: "FLAG_INVALID",
+          message: `Unknown option: ${arg}`,
+          details: { flag: arg }
+        });
+    }
+  }
+
+  return options;
 }
 
 function commandSchema(path: string[] = []): unknown {
@@ -676,6 +949,24 @@ function commandSchema(path: string[] = []): unknown {
       ]),
       response: "ReceiptSubmitResponse",
       responseSchema: responseSchema("ReceiptSubmitResponse")
+    },
+    {
+      command: ["receipts", "submit-download"],
+      summary: "Issue a receipt via a client-generated, E2E-encrypted download link (no customer matching). The QR-ready URL carries the decryption key in its #fragment.",
+      positional: [],
+      flags: authFlags([
+        flag("receipt", "string", true),
+        flag("download-base-url", "string", false, "per-environment receipt.cheqi.io host"),
+        flag("download-url", "string", false, "existing URL returned by a pending attempt"),
+        flag("ciphertext", "string", false, "exact ciphertext returned by PENDING_UPLOAD"),
+        flag("template-hash", "string", false, "template hash returned by PENDING_UPLOAD"),
+        flag("buyer-type", "enum", false, "CONSUMER", ["CONSUMER", "BUSINESS"]),
+        flag("buyer-country", "string", false),
+        flag("taxes-applied", "enum", false, "true", ["true", "false"]),
+        flag("formats", "string", false, "CHEQI")
+      ]),
+      response: "ReceiptSubmitDownloadResponse",
+      responseSchema: responseSchema("ReceiptSubmitDownloadResponse")
     }
   ];
 
@@ -777,14 +1068,32 @@ function responseSchema(name: string): Record<string, unknown> {
         receiptCount: { type: "number" },
         cheqiReceiptId: { type: "string" },
         createdAt: { type: "string", format: "date-time" },
+        deliveryStatus: { type: "string" },
         templateHash: { type: "string" },
+        canonicalJson: { type: "string" },
         downloadUrl: { type: "string" },
+        downloadCiphertext: { type: "string" },
         response: { type: ["object", "array", "string", "number", "boolean", "null"] },
         message: { type: "string" },
         customerEmail: { type: "string" },
         sessionId: { type: "string" },
         session: { type: "string" }
       }, ["success", "deliveryMethod", "customerFound", "receiptCount", "response", "message"]);
+    case "ReceiptSubmitDownloadResponse":
+      return objectSchema({
+        success: { type: "boolean", const: true },
+        deliveryMethod: { type: "string", const: "DOWNLOAD_LINK" },
+        deliveryStatus: { type: "string", enum: ["PENDING_DOWNLOAD_TEMPLATE", "PENDING_DOWNLOAD_UPLOAD", "DELIVERED_DOWNLOAD", "CUSTOMER_NOT_FOUND"] },
+        downloadUrl: { type: "string", description: "Customer-facing URL with the AES key in the #fragment; render as QR, never log server-side." },
+        downloadId: { type: "string" },
+        retryable: { type: "boolean" },
+        retry: { type: "object", additionalProperties: true },
+        pendingReason: { type: "string" },
+        cheqiReceiptId: { type: "string" },
+        createdAt: { type: "string", format: "date-time" },
+        expiresAt: { type: "string", format: "date-time" },
+        templateHash: { type: "string" }
+      }, ["success", "deliveryMethod", "deliveryStatus", "downloadUrl", "downloadId"]);
     default:
       return objectSchema({}, []);
   }
@@ -824,6 +1133,7 @@ function authFlags(flags: Record<string, unknown>[]): Record<string, unknown>[] 
     flag("access-token", "string", false),
     flag("env", "enum", false, "sandbox", ["sandbox", "test", "production"]),
     flag("endpoint", "string", false),
+    flag("download-base-url", "string", false),
     flag("timeout", "number", false, 30),
     flag("verbose", "boolean", false, false)
   ];
@@ -835,6 +1145,7 @@ function parseSubmitOptions(args: string[]): SubmitOptions {
     accessToken: env("CHEQI_ACCESS_TOKEN"),
     env: env("CHEQI_ENV") ?? "sandbox",
     endpoint: env("CHEQI_API_ENDPOINT"),
+    downloadBaseUrl: env("CHEQI_DOWNLOAD_BASE_URL"),
     receiptPath: null,
     matchBy: null,
     matchValue: null,
@@ -857,6 +1168,9 @@ function parseSubmitOptions(args: string[]): SubmitOptions {
         break;
       case "--endpoint":
         options.endpoint = readFlagValue(args, ++index, arg);
+        break;
+      case "--download-base-url":
+        options.downloadBaseUrl = readFlagValue(args, ++index, arg);
         break;
       case "--receipt":
         options.receiptPath = readFlagValue(args, ++index, arg);
@@ -908,6 +1222,7 @@ function parseAuthOptions(args: string[]): AuthOptions {
     accessToken: stringFlag(flags, "access-token") ?? stringFlag(flags, "accessToken") ?? env("CHEQI_ACCESS_TOKEN"),
     env: stringFlag(flags, "env") ?? env("CHEQI_ENV") ?? "sandbox",
     endpoint: stringFlag(flags, "endpoint") ?? env("CHEQI_API_ENDPOINT"),
+    downloadBaseUrl: stringFlag(flags, "download-base-url") ?? env("CHEQI_DOWNLOAD_BASE_URL"),
     timeoutSeconds: parsePositiveInt(stringFlag(flags, "timeout") ?? env("CHEQI_TIMEOUT_SECONDS"), 30),
     verbose: booleanFlag(flags, "verbose")
   };
@@ -933,6 +1248,10 @@ function buildSDK(options: AuthOptions) {
     .apiEndpoint(resolveEndpoint(options))
     .timeoutSeconds(options.timeoutSeconds)
     .logger(options.verbose ? new StderrLogger() : new NoopLogger());
+
+  if (options.downloadBaseUrl || normalize(options.env) === "test") {
+    builder.receiptDownloadBaseUrl(options.downloadBaseUrl ?? resolveDownloadBaseUrl(options));
+  }
 
   if (options.apiKey) {
     builder.apiKey(options.apiKey);

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { execFile } from "node:child_process";
@@ -318,4 +318,221 @@ test("session create uses environment fallback", async () => {
   const session = JSON.parse(rawSession);
   assert.equal(session.auth.env, "test");
   assert.equal(session.auth.endpoint, "https://example.invalid");
+});
+
+test("submit-download issues a client-encrypted download link end to end", async () => {
+  const { decryptDownloadEnvelope, parseDownloadUrl } = await import("@cheqi/sdk/download");
+  const cwd = await mkdtemp(join(tmpdir(), "cheqi-cli-submit-download-"));
+
+  const requests = [];
+  const server = createServer((req, res) => {
+    let body = "";
+    req.on("data", (chunk) => {
+      body += chunk;
+    });
+    req.on("end", () => {
+      requests.push({ url: req.url, body: body ? JSON.parse(body) : null });
+      res.writeHead(req.url === "/receipt/download" ? 201 : 200, { "content-type": "application/json" });
+      if (req.url === "/recipient/resolve") {
+        res.end(JSON.stringify({
+          routeFound: true,
+          deliveryRouteType: "DOWNLOAD_FALLBACK",
+          matchId: "match-download",
+          recipients: [{ id: "download", acceptedFormats: ["CHEQI", "UBL_PURCHASE_RECEIPT"] }],
+          buyerCountryCode: "NL",
+          buyerType: "CONSUMER"
+        }));
+      } else if (req.url === "/receipt/template") {
+        // issueDate is a string because real template responses are plain JSON.
+        // @cheqi/sdk >= 0.3.0 builds the envelope from this canonical response.
+        res.end(JSON.stringify({
+          cheqi: { documentNumber: "INV-DL-1", issueDate: "2026-07-14T09:30:00Z", currency: "EUR", totalAmount: 12.1, products: [] },
+          ublPurchaseReceipt: "<PurchaseReceipt/>"
+        }));
+      } else {
+        res.end(JSON.stringify({
+          cheqiReceiptId: "CHQ-20260714-101010-ABC123",
+          createdAt: "2026-07-14T10:10:10Z",
+          expiresAt: "2027-07-14T10:10:10Z"
+        }));
+      }
+    });
+  });
+  await new Promise((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+  const endpoint = `http://127.0.0.1:${server.address().port}`;
+
+  try {
+    const receiptPath = join(cwd, "receipt.json");
+    await writeFile(receiptPath, JSON.stringify({
+      documentNumber: "INV-DL-1",
+      currency: "EUR",
+      products: [{ name: "Socks", quantity: 1, unitPrice: 10, taxes: [{ rate: 21, type: "VAT" }] }]
+    }));
+
+    const result = await run(cwd, [
+      "receipts",
+      "submit-download",
+      "--receipt",
+      receiptPath,
+      "--api-key",
+      "sk_test_x",
+      "--endpoint",
+      endpoint,
+      "--download-base-url",
+      "https://receipt.example.test",
+      "--timeout",
+      "2"
+    ]);
+
+    assert.equal(result.success, true);
+    assert.equal(result.deliveryMethod, "DOWNLOAD");
+    assert.equal(result.deliveryStatus, "DELIVERED_DOWNLOAD");
+    assert.equal(result.cheqiReceiptId, "CHQ-20260714-101010-ABC123");
+    assert.match(result.downloadUrl, /^https:\/\/receipt\.example\.test\/[A-Za-z0-9_-]{22}#[A-Za-z0-9_-]{43}$/);
+
+    // No customer matching involved; template then upload.
+    assert.deepEqual(requests.map((r) => r.url), ["/recipient/resolve", "/receipt/template", "/receipt/download"]);
+
+    // The uploaded blob decrypts with the key from the URL fragment and carries the template output.
+    const upload = requests[2].body;
+    const { downloadId, contentKey } = parseDownloadUrl(result.downloadUrl);
+    assert.equal(upload.downloadId, downloadId);
+    assert.equal(typeof upload.templateHash, "string");
+    const envelope = await decryptDownloadEnvelope(upload.ciphertext, contentKey);
+    assert.equal(envelope.cheqi.documentNumber, "INV-DL-1");
+    assert.equal(envelope.ublPurchaseReceipt, "<PurchaseReceipt/>");
+
+    // The key never left the machine: no request contains the fragment.
+    assert.ok(!JSON.stringify(requests).includes(contentKey));
+  } finally {
+    await new Promise((resolveClose, rejectClose) => {
+      server.close((error) => error ? rejectClose(error) : resolveClose());
+    });
+  }
+});
+
+test("submit-download returns its URL while template generation is unavailable and resumes it", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "cheqi-cli-submit-download-pending-template-"));
+  const receiptPath = join(cwd, "receipt.json");
+  await writeFile(receiptPath, JSON.stringify({
+    documentNumber: "INV-DEFERRED-1",
+    currency: "EUR",
+    products: []
+  }));
+
+  let available = false;
+  const requests = [];
+  const server = createServer((req, res) => {
+    let body = "";
+    req.on("data", (chunk) => { body += chunk; });
+    req.on("end", () => {
+      requests.push({ url: req.url, body: body ? JSON.parse(body) : null });
+      if (!available) {
+        res.writeHead(503, { "content-type": "application/json" });
+        res.end(JSON.stringify({ message: "temporarily unavailable" }));
+      } else if (req.url === "/receipt/template") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ cheqi: { documentNumber: "INV-DEFERRED-1" } }));
+      } else {
+        res.writeHead(201, { "content-type": "application/json" });
+        res.end(JSON.stringify({ cheqiReceiptId: "CHQ-DEFERRED-1" }));
+      }
+    });
+  });
+  await new Promise((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+  const endpoint = `http://127.0.0.1:${server.address().port}`;
+
+  try {
+    const baseArgs = [
+      "receipts", "submit-download",
+      "--receipt", receiptPath,
+      "--api-key", "sk_test_x",
+      "--endpoint", endpoint,
+      "--download-base-url", "http://localhost:5190",
+      "--timeout", "1"
+    ];
+    const pending = await run(cwd, baseArgs);
+    assert.equal(pending.success, true);
+    assert.equal(pending.deliveryStatus, "PENDING_DOWNLOAD_TEMPLATE");
+    assert.match(pending.downloadUrl, /^http:\/\/localhost:5190\/[A-Za-z0-9_-]{22}#[A-Za-z0-9_-]{43}$/);
+
+    available = true;
+    const completed = await run(cwd, [...baseArgs, "--download-url", pending.downloadUrl]);
+    assert.equal(completed.deliveryStatus, "DELIVERED_DOWNLOAD");
+    assert.equal(completed.downloadUrl, pending.downloadUrl);
+    assert.equal(completed.downloadId, pending.downloadId);
+    assert.equal(completed.cheqiReceiptId, "CHQ-DEFERRED-1");
+  } finally {
+    await new Promise((resolveClose, rejectClose) => {
+      server.close((error) => error ? rejectClose(error) : resolveClose());
+    });
+  }
+});
+
+test("submit-download returns exact ciphertext for an unconfirmed upload", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "cheqi-cli-submit-download-pending-upload-"));
+  const receiptPath = join(cwd, "receipt.json");
+  await writeFile(receiptPath, JSON.stringify({ documentNumber: "INV-DEFERRED-2", currency: "EUR", products: [] }));
+
+  let uploadAvailable = false;
+  const uploadedCiphertexts = [];
+  const server = createServer((req, res) => {
+    let body = "";
+    req.on("data", (chunk) => { body += chunk; });
+    req.on("end", () => {
+      const parsed = body ? JSON.parse(body) : null;
+      if (req.url === "/recipient/resolve") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          routeFound: true,
+          deliveryRouteType: "DOWNLOAD_FALLBACK",
+          matchId: "match-download",
+          recipients: [{ id: "download", acceptedFormats: ["CHEQI"] }],
+          buyerCountryCode: "NL",
+          buyerType: "CONSUMER"
+        }));
+      } else if (req.url === "/receipt/template") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ cheqi: { documentNumber: "INV-DEFERRED-2" } }));
+      } else {
+        uploadedCiphertexts.push(parsed.ciphertext);
+        res.writeHead(uploadAvailable ? 201 : 503, { "content-type": "application/json" });
+        res.end(JSON.stringify(uploadAvailable
+          ? { cheqiReceiptId: "CHQ-DEFERRED-2" }
+          : { message: "temporarily unavailable" }));
+      }
+    });
+  });
+  await new Promise((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+  const endpoint = `http://127.0.0.1:${server.address().port}`;
+
+  try {
+    const baseArgs = [
+      "receipts", "submit-download",
+      "--receipt", receiptPath,
+      "--api-key", "sk_test_x",
+      "--endpoint", endpoint,
+      "--download-base-url", "http://localhost:5190",
+      "--timeout", "1"
+    ];
+    const pending = await run(cwd, baseArgs);
+    assert.equal(pending.deliveryStatus, "PENDING_DOWNLOAD_UPLOAD");
+    assert.equal(typeof pending.downloadCiphertext, "string");
+    assert.equal(typeof pending.templateHash, "string");
+
+    uploadAvailable = true;
+    const completed = await run(cwd, [
+      ...baseArgs,
+      "--download-url", pending.downloadUrl,
+      "--ciphertext", pending.downloadCiphertext,
+      "--template-hash", pending.templateHash
+    ]);
+    assert.equal(completed.deliveryStatus, "DELIVERED_DOWNLOAD");
+    assert.equal(completed.cheqiReceiptId, "CHQ-DEFERRED-2");
+    assert.ok(uploadedCiphertexts.every((ciphertext) => ciphertext === pending.downloadCiphertext));
+  } finally {
+    await new Promise((resolveClose, rejectClose) => {
+      server.close((error) => error ? rejectClose(error) : resolveClose());
+    });
+  }
 });
