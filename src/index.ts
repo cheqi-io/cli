@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { stdin } from "node:process";
 import {
@@ -19,7 +20,9 @@ import {
   parseDownloadUrl
 } from "@cheqi/sdk/download";
 
-const VERSION = "0.3.0";
+const VERSION = JSON.parse(
+  readFileSync(new URL("../package.json", import.meta.url), "utf8")
+).version as string;
 const SESSIONS_DIR = ".cheqi/sessions";
 
 /**
