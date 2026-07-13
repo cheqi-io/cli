@@ -42,7 +42,7 @@ cheqi session create \
   --session agent-a \
   --currency EUR \
   --document-number INV-001 \
-  --card-par 5001DIACKX3POWK6FCWW3X8792ISP
+  --card-par YOUR_CARD_PAR
 
 cheqi receipt add-product \
   --session agent-a \
@@ -62,7 +62,7 @@ To call the Cheqi matching service before adding products:
 ```bash
 CHEQI_API_KEY=sk_test_... cheqi session match \
   --session agent-a \
-  --card-par 5001DIACKX3POWK6FCWW3X8792ISP
+  --card-par YOUR_CARD_PAR
 ```
 
 ## Direct JSON Workflow
@@ -70,7 +70,7 @@ CHEQI_API_KEY=sk_test_... cheqi session match \
 ```bash
 CHEQI_API_KEY=sk_test_... npx @cheqi/cli receipts submit \
   --match-by card_par \
-  --match-value 5001DIACKX3POWK6FCWW3X8792ISP \
+  --match-value YOUR_CARD_PAR \
   --receipt receipt.json
 ```
 
